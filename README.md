@@ -176,3 +176,47 @@
   --init-checkpoint gomoku_7x7_5.pt \
   --checkpoint gomoku_15x15_5.pt
 ```
+
+## MCTS 课程训练脚本
+
+仓库里现在提供了一套更适合 `AlphaZero` 风格的分阶段训练脚本：
+
+1. `5x5 connect4`
+2. `7x7 connect5`
+3. `9x9 connect5`
+4. `15x15 connect5`
+
+如果你已经在外部激活好 Python 环境，可以直接逐阶段运行：
+
+```bash
+./train_mcts_5x5_4.sh
+INIT_CHECKPOINT=./gomoku_mcts_5x5_4.pt ./train_mcts_7x7_5.sh
+INIT_CHECKPOINT=./gomoku_mcts_7x7_5.pt ./train_mcts_9x9_5.sh
+INIT_CHECKPOINT=./gomoku_mcts_9x9_5.pt ./train_mcts_15x15_5.sh
+```
+
+也可以一条命令按课程顺序串起来：
+
+```bash
+./train_mcts_curriculum.sh
+```
+
+默认 checkpoint 文件名分别是：
+
+- `gomoku_mcts_5x5_4.pt`
+- `gomoku_mcts_7x7_5.pt`
+- `gomoku_mcts_9x9_5.pt`
+- `gomoku_mcts_15x15_5.pt`
+
+这些脚本都会打印：
+
+- 自博弈中途进度
+- `random_win_rate`
+- `heuristic_win_rate`
+- `eval_trace` 样例棋谱
+
+如果你想覆盖默认参数，继续用环境变量即可，例如：
+
+```bash
+DEVICE=cuda MCTS_SIMS=256 EVAL_MCTS_SIMS=512 ./train_mcts_9x9_5.sh
+```

@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -815,6 +816,7 @@ def train(args: argparse.Namespace) -> None:
         policy.eval()
         winners: list[int] = []
         lengths: list[int] = []
+        iteration_start = time.perf_counter()
         for _ in range(args.games_per_iter):
             examples, winner, moves = self_play_game(
                 policy=policy,
@@ -832,11 +834,20 @@ def train(args: argparse.Namespace) -> None:
             replay_buffer.extend(examples)
             winners.append(winner)
             lengths.append(moves)
+            games_done = len(winners)
+            if args.log_every_games > 0 and games_done % args.log_every_games == 0:
+                elapsed = time.perf_counter() - iteration_start
+                avg_len_so_far = float(np.mean(lengths)) if lengths else 0.0
+                print(
+                    f"iter={iteration:5d} selfplay={games_done:3d}/{args.games_per_iter:3d} "
+                    f"avg_len={avg_len_so_far:6.2f} buffer={len(replay_buffer):6d} "
+                    f"elapsed={elapsed:7.1f}s"
+                )
 
         losses: list[tuple[float, float, float]] = []
         if len(replay_buffer) >= args.batch_size:
             policy.train()
-            for _ in range(args.train_steps):
+            for step_idx in range(args.train_steps):
                 batch = random.sample(replay_buffer, args.batch_size)
                 losses.append(
                     train_batch(
@@ -847,6 +858,14 @@ def train(args: argparse.Namespace) -> None:
                         value_coef=args.value_coef,
                     )
                 )
+                if args.log_every_train_steps > 0 and (step_idx + 1) % args.log_every_train_steps == 0:
+                    elapsed = time.perf_counter() - iteration_start
+                    recent_loss, recent_policy_loss, recent_value_loss = losses[-1]
+                    print(
+                        f"iter={iteration:5d} train={step_idx + 1:3d}/{args.train_steps:3d} "
+                        f"loss={recent_loss:7.4f} policy={recent_policy_loss:7.4f} "
+                        f"value={recent_value_loss:7.4f} elapsed={elapsed:7.1f}s"
+                    )
 
         avg_loss = float(np.mean([x[0] for x in losses])) if losses else 0.0
         avg_policy_loss = float(np.mean([x[1] for x in losses])) if losses else 0.0
@@ -1213,6 +1232,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--eval-heuristic-games", type=int, default=0)
     train_parser.add_argument("--eval-trace-games", type=int, default=0)
     train_parser.add_argument("--eval-trace-max-moves", type=int, default=20)
+    train_parser.add_argument("--log-every-games", type=int, default=0)
+    train_parser.add_argument("--log-every-train-steps", type=int, default=0)
     train_parser.add_argument("--save-every", type=int, default=10)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--init-checkpoint", type=Path, default=None)

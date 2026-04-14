@@ -292,16 +292,18 @@ class MCTSNode:
     def select_action(self, c_puct: float) -> int:
         total_visits = sum(self.visit_counts.values())
         sqrt_total = math.sqrt(total_visits + 1.0)
-        best_action = -1
         best_score = -float("inf")
+        best_actions: list[int] = []
         for action, prior in self.priors.items():
             q = self.q_value(action)
             u = c_puct * prior * sqrt_total / (1.0 + self.visit_counts[action])
             score = q + u
             if score > best_score:
                 best_score = score
-                best_action = action
-        return best_action
+                best_actions = [action]
+            elif math.isclose(score, best_score, rel_tol=1e-9, abs_tol=1e-12):
+                best_actions.append(action)
+        return int(random.choice(best_actions))
 
     def child_for_action(self, action: int) -> "MCTSNode":
         child = self.children.get(action)
@@ -330,6 +332,13 @@ def terminal_value(winner: int, current_player: int) -> float:
     return 1.0 if winner == current_player else -1.0
 
 
+def random_argmax(values: np.ndarray) -> int:
+    flat = np.asarray(values).reshape(-1)
+    max_value = np.max(flat)
+    candidates = np.flatnonzero(np.isclose(flat, max_value))
+    return int(np.random.choice(candidates))
+
+
 def sample_from_visits(visits: np.ndarray, temperature: float) -> tuple[int, np.ndarray]:
     flat = visits.reshape(-1).astype(np.float64)
     if np.all(flat == 0):
@@ -337,7 +346,7 @@ def sample_from_visits(visits: np.ndarray, temperature: float) -> tuple[int, np.
 
     if temperature <= 1e-6:
         probs = np.zeros_like(flat, dtype=np.float64)
-        probs[int(np.argmax(flat))] = 1.0
+        probs[random_argmax(flat)] = 1.0
     else:
         adjusted = np.power(flat, 1.0 / temperature)
         probs = adjusted / np.sum(adjusted)

@@ -111,6 +111,25 @@ def count_one_side(
     return total
 
 
+def count_one_side_with_open_end(
+    board: np.ndarray,
+    row: int,
+    col: int,
+    dr: int,
+    dc: int,
+    player: int,
+) -> tuple[int, bool]:
+    board_size = board.shape[0]
+    total = 0
+    r, c = row + dr, col + dc
+    while 0 <= r < board_size and 0 <= c < board_size and board[r, c] == player:
+        total += 1
+        r += dr
+        c += dc
+    open_end = 0 <= r < board_size and 0 <= c < board_size and board[r, c] == 0
+    return total, open_end
+
+
 def is_winning_move(
     board: np.ndarray,
     row: int,
@@ -154,6 +173,26 @@ def encode_state(board: np.ndarray, current_player: int) -> torch.Tensor:
     opponent = (board == -current_player).astype(np.float32)
     legal = (board == 0).astype(np.float32)
     return torch.from_numpy(np.stack([current, opponent, legal], axis=0))
+
+
+def apply_state_symmetry(state: torch.Tensor, symmetry: int) -> torch.Tensor:
+    transformed = state
+    rotations = symmetry % 4
+    if rotations:
+        transformed = torch.rot90(transformed, k=rotations, dims=(-2, -1))
+    if symmetry >= 4:
+        transformed = torch.flip(transformed, dims=(-1,))
+    return transformed.contiguous()
+
+
+def apply_policy_symmetry(policy: np.ndarray, board_size: int, symmetry: int) -> np.ndarray:
+    transformed = policy.reshape(board_size, board_size)
+    rotations = symmetry % 4
+    if rotations:
+        transformed = np.rot90(transformed, k=rotations)
+    if symmetry >= 4:
+        transformed = np.flip(transformed, axis=1)
+    return np.ascontiguousarray(transformed.reshape(-1), dtype=np.float32)
 
 
 class PolicyValueNet(nn.Module):
@@ -385,6 +424,120 @@ def choose_ai_action(
     )
 
 
+def immediate_winning_actions(board: np.ndarray, player: int, win_length: int) -> list[int]:
+    winning_actions: list[int] = []
+    for action in np.flatnonzero((board == 0).reshape(-1)):
+        row, col = action_to_coords(int(action), board.shape[0])
+        next_board = board.copy()
+        next_board[row, col] = player
+        if is_winning_move(next_board, row, col, player, win_length):
+            winning_actions.append(int(action))
+    return winning_actions
+
+
+def heuristic_candidate_actions(board: np.ndarray, radius: int = 2) -> list[int]:
+    board_size = board.shape[0]
+    occupied = np.argwhere(board != 0)
+    if len(occupied) == 0:
+        center = board_size // 2
+        return [coords_to_action(center, center, board_size)]
+
+    candidates: set[int] = set()
+    for row, col in occupied:
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                rr = int(row) + dr
+                cc = int(col) + dc
+                if 0 <= rr < board_size and 0 <= cc < board_size and board[rr, cc] == 0:
+                    candidates.add(coords_to_action(rr, cc, board_size))
+    if candidates:
+        return sorted(candidates)
+    return [int(action) for action in np.flatnonzero((board == 0).reshape(-1))]
+
+
+def heuristic_pattern_score(length: int, open_ends: int, win_length: int) -> float:
+    if length >= win_length:
+        return 1_000_000.0
+    if length == win_length - 1:
+        return 100_000.0 if open_ends == 2 else 20_000.0
+    if length == win_length - 2:
+        return 8_000.0 if open_ends == 2 else 1_500.0
+    if length == win_length - 3:
+        return 400.0 if open_ends == 2 else 80.0
+    return float(length * length)
+
+
+def score_heuristic_move(
+    board: np.ndarray,
+    action: int,
+    player: int,
+    win_length: int,
+) -> float:
+    board_size = board.shape[0]
+    row, col = action_to_coords(action, board_size)
+    trial_board = board.copy()
+    trial_board[row, col] = player
+
+    score = 0.0
+    for dr, dc in ((1, 0), (0, 1), (1, 1), (1, -1)):
+        forward_count, forward_open = count_one_side_with_open_end(trial_board, row, col, dr, dc, player)
+        backward_count, backward_open = count_one_side_with_open_end(
+            trial_board, row, col, -dr, -dc, player
+        )
+        length = 1 + forward_count + backward_count
+        open_ends = int(forward_open) + int(backward_open)
+        score += heuristic_pattern_score(length, open_ends, win_length)
+
+    center = (board_size - 1) / 2.0
+    center_bias = board_size - (abs(row - center) + abs(col - center))
+    r0 = max(0, row - 1)
+    r1 = min(board_size, row + 2)
+    c0 = max(0, col - 1)
+    c1 = min(board_size, col + 2)
+    neighborhood = board[r0:r1, c0:c1]
+    neighbor_bias = float(np.count_nonzero(neighborhood)) * 3.0
+
+    own_next_wins = len(immediate_winning_actions(trial_board, player, win_length))
+    opp_next_wins = len(immediate_winning_actions(trial_board, -player, win_length))
+    if own_next_wins >= 2:
+        score += 700_000.0
+    elif own_next_wins == 1:
+        score += 90_000.0
+    if opp_next_wins >= 2:
+        score -= 800_000.0
+    elif opp_next_wins == 1:
+        score -= 120_000.0
+
+    return score + center_bias + neighbor_bias
+
+
+def choose_heuristic_action(
+    board: np.ndarray,
+    current_player: int,
+    win_length: int,
+) -> int:
+    candidate_actions = heuristic_candidate_actions(board)
+    if not candidate_actions:
+        raise ValueError("no legal actions available")
+
+    own_wins = immediate_winning_actions(board, current_player, win_length)
+    if own_wins:
+        return own_wins[0]
+
+    opp_wins = set(immediate_winning_actions(board, -current_player, win_length))
+    best_action = candidate_actions[0]
+    best_score = -float("inf")
+    for action in candidate_actions:
+        own_score = score_heuristic_move(board, action, current_player, win_length)
+        opp_score = score_heuristic_move(board, action, -current_player, win_length)
+        block_bonus = 500_000.0 if action in opp_wins else 0.0
+        score = own_score + 1.1 * opp_score + block_bonus
+        if score > best_score:
+            best_score = score
+            best_action = action
+    return best_action
+
+
 def self_play_game(
     policy: PolicyValueNet,
     board_size: int,
@@ -396,12 +549,20 @@ def self_play_game(
     temperature_drop_moves: int,
     dirichlet_alpha: float,
     noise_eps: float,
+    random_opening_moves: int,
 ) -> tuple[list[tuple[torch.Tensor, np.ndarray, float]], int, int]:
     env = GomokuEnv(board_size=board_size, win_length=win_length)
     env.reset()
     history: list[tuple[torch.Tensor, np.ndarray, int]] = []
 
     move_idx = 0
+    opening_moves = random.randint(0, max(random_opening_moves, 0))
+    for _ in range(opening_moves):
+        if env.done:
+            break
+        env.step(int(np.random.choice(env.valid_moves())))
+        move_idx += 1
+
     while not env.done:
         move_temp = temperature if move_idx < temperature_drop_moves else 1e-6
         action, visit_probs = choose_mcts_action(
@@ -438,9 +599,17 @@ def train_batch(
     device: torch.device,
     value_coef: float,
 ) -> tuple[float, float, float]:
-    states = torch.stack([item[0] for item in batch]).to(device)
+    augmented_states: list[torch.Tensor] = []
+    augmented_policies: list[np.ndarray] = []
+    for state, target_policy, _ in batch:
+        symmetry = random.randrange(8)
+        board_size = state.shape[-1]
+        augmented_states.append(apply_state_symmetry(state, symmetry))
+        augmented_policies.append(apply_policy_symmetry(target_policy, board_size, symmetry))
+
+    states = torch.stack(augmented_states).to(device)
     target_policies = torch.tensor(
-        np.stack([item[1] for item in batch]),
+        np.stack(augmented_policies),
         dtype=torch.float32,
         device=device,
     )
@@ -500,12 +669,21 @@ def resolve_game_config(
     return policy, board_size, win_length
 
 
-def play_vs_random_once(
+def choose_opponent_action(board: np.ndarray, current_player: int, win_length: int, opponent: str) -> int:
+    if opponent == "random":
+        return int(np.random.choice(np.flatnonzero((board == 0).reshape(-1))))
+    if opponent == "heuristic":
+        return choose_heuristic_action(board=board, current_player=current_player, win_length=win_length)
+    raise ValueError(f"unsupported opponent: {opponent}")
+
+
+def play_vs_opponent_once(
     policy: PolicyValueNet,
     board_size: int,
     win_length: int,
     device: torch.device,
     policy_player: int,
+    opponent: str,
     agent: str,
     mcts_sims: int,
     c_puct: float,
@@ -525,17 +703,23 @@ def play_vs_random_once(
                 c_puct=c_puct,
             )
         else:
-            action = int(np.random.choice(env.valid_moves()))
+            action = choose_opponent_action(
+                board=env.board,
+                current_player=env.current_player,
+                win_length=win_length,
+                opponent=opponent,
+            )
         env.step(action)
     return env.winner
 
 
-def evaluate_vs_random(
+def evaluate_vs_opponent(
     policy: PolicyValueNet,
     board_size: int,
     win_length: int,
     device: torch.device,
     games: int,
+    opponent: str,
     agent: str,
     mcts_sims: int,
     c_puct: float,
@@ -545,12 +729,13 @@ def evaluate_vs_random(
     losses = 0
     for game_idx in range(games):
         policy_player = 1 if game_idx < games // 2 else -1
-        winner = play_vs_random_once(
+        winner = play_vs_opponent_once(
             policy=policy,
             board_size=board_size,
             win_length=win_length,
             device=device,
             policy_player=policy_player,
+            opponent=opponent,
             agent=agent,
             mcts_sims=mcts_sims,
             c_puct=c_puct,
@@ -562,6 +747,56 @@ def evaluate_vs_random(
         else:
             losses += 1
     return wins / max(games, 1), wins, draws, losses
+
+
+def evaluate_self_play_trace(
+    policy: PolicyValueNet,
+    board_size: int,
+    win_length: int,
+    device: torch.device,
+    mcts_sims: int,
+    c_puct: float,
+) -> tuple[int, list[str], str]:
+    env = GomokuEnv(board_size=board_size, win_length=win_length)
+    env.reset()
+    moves: list[str] = []
+
+    while not env.done:
+        player = env.current_player
+        action, _ = choose_mcts_action(
+            policy=policy,
+            board=env.board,
+            current_player=env.current_player,
+            win_length=win_length,
+            device=device,
+            num_simulations=mcts_sims,
+            c_puct=c_puct,
+            temperature=1e-6,
+            add_root_noise=False,
+            dirichlet_alpha=0.3,
+            noise_eps=0.25,
+        )
+        row, col = action_to_coords(action, env.board_size)
+        stone = "X" if player == 1 else "O"
+        moves.append(f"{len(moves) + 1}:{stone}({row + 1},{col + 1})")
+        env.step(action)
+
+    return env.winner, moves, env.render()
+
+
+def winner_to_text(winner: int) -> str:
+    if winner == 1:
+        return "X"
+    if winner == -1:
+        return "O"
+    return "draw"
+
+
+def format_trace_moves(moves: list[str], max_moves: int) -> str:
+    if max_moves <= 0 or len(moves) <= max_moves:
+        return " ".join(moves)
+    head = " ".join(moves[:max_moves])
+    return f"{head} ... total_moves={len(moves)}"
 
 
 def train(args: argparse.Namespace) -> None:
@@ -592,6 +827,7 @@ def train(args: argparse.Namespace) -> None:
                 temperature_drop_moves=args.temperature_drop_moves,
                 dirichlet_alpha=args.dirichlet_alpha,
                 noise_eps=args.noise_eps,
+                random_opening_moves=args.random_opening_moves,
             )
             replay_buffer.extend(examples)
             winners.append(winner)
@@ -627,18 +863,53 @@ def train(args: argparse.Namespace) -> None:
         )
         if args.eval_every > 0 and iteration % args.eval_every == 0:
             policy.eval()
-            win_rate, wins, eval_draws, eval_losses = evaluate_vs_random(
+            win_rate, wins, eval_draws, eval_losses = evaluate_vs_opponent(
                 policy=policy,
                 board_size=args.board_size,
                 win_length=args.win_length,
                 device=device,
                 games=args.eval_games,
+                opponent="random",
                 agent="mcts",
                 mcts_sims=args.eval_mcts_sims,
                 c_puct=args.c_puct,
             )
             message += f" random_win_rate={win_rate:.3f} ({wins}/{eval_draws}/{eval_losses})"
+            if args.eval_heuristic_games > 0:
+                heuristic_win_rate, heuristic_wins, heuristic_draws, heuristic_losses = evaluate_vs_opponent(
+                    policy=policy,
+                    board_size=args.board_size,
+                    win_length=args.win_length,
+                    device=device,
+                    games=args.eval_heuristic_games,
+                    opponent="heuristic",
+                    agent="mcts",
+                    mcts_sims=args.eval_mcts_sims,
+                    c_puct=args.c_puct,
+                )
+                message += (
+                    f" heuristic_win_rate={heuristic_win_rate:.3f} "
+                    f"({heuristic_wins}/{heuristic_draws}/{heuristic_losses})"
+                )
         print(message)
+
+        if args.eval_every > 0 and iteration % args.eval_every == 0 and args.eval_trace_games > 0:
+            for trace_idx in range(args.eval_trace_games):
+                winner, trace_moves, final_board = evaluate_self_play_trace(
+                    policy=policy,
+                    board_size=args.board_size,
+                    win_length=args.win_length,
+                    device=device,
+                    mcts_sims=args.eval_mcts_sims,
+                    c_puct=args.c_puct,
+                )
+                print(
+                    f"eval_trace game={trace_idx + 1} winner={winner_to_text(winner)} "
+                    f"moves={len(trace_moves)}"
+                )
+                print(f"eval_trace seq {format_trace_moves(trace_moves, args.eval_trace_max_moves)}")
+                print("eval_trace board:")
+                print(final_board)
 
         if args.save_every > 0 and iteration % args.save_every == 0:
             checkpoint_path = last_checkpoint_path(args.checkpoint)
@@ -658,18 +929,19 @@ def evaluate(args: argparse.Namespace) -> None:
         arg_channels=args.channels,
         device=device,
     )
-    win_rate, wins, draws, losses = evaluate_vs_random(
+    win_rate, wins, draws, losses = evaluate_vs_opponent(
         policy=policy,
         board_size=board_size,
         win_length=win_length,
         device=device,
         games=args.games,
+        opponent=args.opponent,
         agent=args.agent,
         mcts_sims=args.mcts_sims,
         c_puct=args.c_puct,
     )
     print(f"device={device}")
-    print(f"agent={args.agent} mcts_sims={args.mcts_sims}")
+    print(f"agent={args.agent} opponent={args.opponent} mcts_sims={args.mcts_sims}")
     print(f"win_rate={win_rate:.3f} wins={wins} draws={draws} losses={losses}")
 
 
@@ -935,16 +1207,21 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--temperature-drop-moves", type=int, default=8)
     train_parser.add_argument("--dirichlet-alpha", type=float, default=0.3)
     train_parser.add_argument("--noise-eps", type=float, default=0.25)
+    train_parser.add_argument("--random-opening-moves", type=int, default=0)
     train_parser.add_argument("--eval-every", type=int, default=10)
     train_parser.add_argument("--eval-games", type=int, default=20)
+    train_parser.add_argument("--eval-heuristic-games", type=int, default=0)
+    train_parser.add_argument("--eval-trace-games", type=int, default=0)
+    train_parser.add_argument("--eval-trace-max-moves", type=int, default=20)
     train_parser.add_argument("--save-every", type=int, default=10)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--init-checkpoint", type=Path, default=None)
     train_parser.set_defaults(func=train)
 
-    eval_parser = subparsers.add_parser("eval", help="evaluate against random agent")
+    eval_parser = subparsers.add_parser("eval", help="evaluate against a baseline opponent")
     add_common_arguments(eval_parser)
     add_inference_arguments(eval_parser)
+    eval_parser.add_argument("--opponent", choices=["random", "heuristic"], default="random")
     eval_parser.add_argument("--games", type=int, default=40)
     eval_parser.set_defaults(func=evaluate)
 

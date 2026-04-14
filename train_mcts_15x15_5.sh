@@ -2,10 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONDA_BIN="${CONDA_BIN:-$HOME/miniconda3/bin/conda}"
-ENV_NAME="${ENV_NAME:-lerobot}"
 
-INIT_CHECKPOINT="${INIT_CHECKPOINT:-$ROOT_DIR/gomoku_7x7_5.pt}"
 OUTPUT_CHECKPOINT="${OUTPUT_CHECKPOINT:-$ROOT_DIR/gomoku_mcts_15x15_5.pt}"
 
 BOARD_SIZE="${BOARD_SIZE:-15}"
@@ -13,30 +10,34 @@ WIN_LENGTH="${WIN_LENGTH:-5}"
 CHANNELS="${CHANNELS:-64}"
 
 ITERATIONS="${ITERATIONS:-3000}"
-GAMES_PER_ITER="${GAMES_PER_ITER:-12}"
+GAMES_PER_ITER="${GAMES_PER_ITER:-32}"
 TRAIN_STEPS="${TRAIN_STEPS:-64}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
-BUFFER_SIZE="${BUFFER_SIZE:-50000}"
+BUFFER_SIZE="${BUFFER_SIZE:-100000}"
 
-MCTS_SIMS="${MCTS_SIMS:-64}"
-EVAL_MCTS_SIMS="${EVAL_MCTS_SIMS:-160}"
+MCTS_SIMS="${MCTS_SIMS:-256}"
+EVAL_MCTS_SIMS="${EVAL_MCTS_SIMS:-512}"
 EVAL_EVERY="${EVAL_EVERY:-10}"
 EVAL_GAMES="${EVAL_GAMES:-20}"
+EVAL_HEURISTIC_GAMES="${EVAL_HEURISTIC_GAMES:-8}"
+EVAL_TRACE_GAMES="${EVAL_TRACE_GAMES:-1}"
+EVAL_TRACE_MAX_MOVES="${EVAL_TRACE_MAX_MOVES:-20}"
 SAVE_EVERY="${SAVE_EVERY:-10}"
 
 LR="${LR:-5e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-4}"
 VALUE_COEF="${VALUE_COEF:-1.0}"
 CPUCT="${CPUCT:-1.5}"
-TEMPERATURE="${TEMPERATURE:-1.0}"
-TEMPERATURE_DROP_MOVES="${TEMPERATURE_DROP_MOVES:-10}"
-DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.3}"
-NOISE_EPS="${NOISE_EPS:-0.25}"
+TEMPERATURE="${TEMPERATURE:-0.6}"
+TEMPERATURE_DROP_MOVES="${TEMPERATURE_DROP_MOVES:-3}"
+DIRICHLET_ALPHA="${DIRICHLET_ALPHA:-0.03}"
+NOISE_EPS="${NOISE_EPS:-0.10}"
+RANDOM_OPENING_MOVES="${RANDOM_OPENING_MOVES:-2}"
 SEED="${SEED:-42}"
 DEVICE="${DEVICE:-auto}"
 
 CMD=(
-  "$CONDA_BIN" run -n "$ENV_NAME" python "$ROOT_DIR/gomoku_mcts.py" train
+  python "$ROOT_DIR/gomoku_mcts.py" train
   --board-size "$BOARD_SIZE"
   --win-length "$WIN_LENGTH"
   --channels "$CHANNELS"
@@ -49,6 +50,9 @@ CMD=(
   --eval-mcts-sims "$EVAL_MCTS_SIMS"
   --eval-every "$EVAL_EVERY"
   --eval-games "$EVAL_GAMES"
+  --eval-heuristic-games "$EVAL_HEURISTIC_GAMES"
+  --eval-trace-games "$EVAL_TRACE_GAMES"
+  --eval-trace-max-moves "$EVAL_TRACE_MAX_MOVES"
   --save-every "$SAVE_EVERY"
   --lr "$LR"
   --weight-decay "$WEIGHT_DECAY"
@@ -58,14 +62,15 @@ CMD=(
   --temperature-drop-moves "$TEMPERATURE_DROP_MOVES"
   --dirichlet-alpha "$DIRICHLET_ALPHA"
   --noise-eps "$NOISE_EPS"
+  --random-opening-moves "$RANDOM_OPENING_MOVES"
   --seed "$SEED"
   --device "$DEVICE"
   --checkpoint "$OUTPUT_CHECKPOINT"
 )
 
-if [[ -f "$INIT_CHECKPOINT" ]]; then
+if [[ -n "${INIT_CHECKPOINT:-}" && -f "$INIT_CHECKPOINT" ]]; then
   CMD+=(--init-checkpoint "$INIT_CHECKPOINT")
-else
+elif [[ -n "${INIT_CHECKPOINT:-}" ]]; then
   echo "init checkpoint not found, training from scratch: $INIT_CHECKPOINT"
 fi
 

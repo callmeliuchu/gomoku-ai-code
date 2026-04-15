@@ -197,16 +197,23 @@ def apply_policy_symmetry(policy: np.ndarray, board_size: int, symmetry: int) ->
 
 
 class PolicyValueNet(nn.Module):
-    def __init__(self, channels: int = 64):
+    def __init__(self, channels: int = 64, conv_layers: int = 3):
         super().__init__()
-        self.trunk = nn.Sequential(
+        if conv_layers < 1:
+            raise ValueError("conv_layers must be >= 1")
+
+        trunk_layers: list[nn.Module] = [
             nn.Conv2d(3, channels, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
+        ]
+        for _ in range(conv_layers - 1):
+            trunk_layers.extend(
+                [
+                    nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+                    nn.ReLU(),
+                ]
+            )
+        self.trunk = nn.Sequential(*trunk_layers)
         self.policy_head = nn.Conv2d(channels, 1, kernel_size=1)
         self.value_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -643,6 +650,7 @@ def save_checkpoint(path: Path, policy: PolicyValueNet, args: argparse.Namespace
         {
             "state_dict": policy.state_dict(),
             "channels": args.channels,
+            "conv_layers": args.conv_layers,
             "board_size": args.board_size,
             "win_length": args.win_length,
         },
@@ -666,14 +674,16 @@ def resolve_game_config(
     arg_board_size: int | None,
     arg_win_length: int | None,
     arg_channels: int,
+    arg_conv_layers: int,
     device: torch.device,
 ) -> tuple[PolicyValueNet, int, int]:
     checkpoint = load_checkpoint(checkpoint_path, map_location=device)
     board_size = int(checkpoint.get("board_size") or arg_board_size or 15)
     win_length = int(checkpoint.get("win_length") or arg_win_length or 5)
     channels = int(checkpoint.get("channels") or arg_channels)
+    conv_layers = int(checkpoint.get("conv_layers") or arg_conv_layers)
 
-    policy = PolicyValueNet(channels=channels).to(device)
+    policy = PolicyValueNet(channels=channels, conv_layers=conv_layers).to(device)
     policy.load_state_dict(checkpoint["state_dict"])
     policy.eval()
     return policy, board_size, win_length
@@ -812,12 +822,13 @@ def format_trace_moves(moves: list[str], max_moves: int) -> str:
 def train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
-    policy = PolicyValueNet(channels=args.channels).to(device)
+    policy = PolicyValueNet(channels=args.channels, conv_layers=args.conv_layers).to(device)
     if args.init_checkpoint is not None and args.init_checkpoint.exists():
         checkpoint = load_checkpoint(args.init_checkpoint, map_location=device)
         policy.load_state_dict(checkpoint["state_dict"])
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     replay_buffer: deque[tuple[torch.Tensor, np.ndarray, float]] = deque(maxlen=args.buffer_size)
+    early_stop_hits = 0
 
     print(f"device={device} board={args.board_size} win={args.win_length}")
 
@@ -944,6 +955,33 @@ def train(args: argparse.Namespace) -> None:
             save_checkpoint(checkpoint_path, policy, args)
             print(f"saved checkpoint to {checkpoint_path}")
 
+        if (
+            args.early_stop_loss > 0.0
+            and iteration >= args.early_stop_min_iterations
+            and losses
+            and avg_loss <= args.early_stop_loss
+        ):
+            early_stop_hits += 1
+            print(
+                f"early_stop progress hits={early_stop_hits}/{args.early_stop_patience} "
+                f"threshold={args.early_stop_loss:.4f}"
+            )
+        else:
+            early_stop_hits = 0
+
+        if (
+            args.early_stop_loss > 0.0
+            and args.early_stop_patience > 0
+            and early_stop_hits >= args.early_stop_patience
+        ):
+            save_checkpoint(args.checkpoint, policy, args)
+            print(
+                f"early_stop triggered at iter={iteration} "
+                f"avg_loss={avg_loss:.4f} threshold={args.early_stop_loss:.4f}"
+            )
+            print(f"saved checkpoint to {args.checkpoint}")
+            return
+
     save_checkpoint(args.checkpoint, policy, args)
     print(f"saved checkpoint to {args.checkpoint}")
 
@@ -955,6 +993,7 @@ def evaluate(args: argparse.Namespace) -> None:
         arg_board_size=args.board_size,
         arg_win_length=args.win_length,
         arg_channels=args.channels,
+        arg_conv_layers=args.conv_layers,
         device=device,
     )
     win_rate, wins, draws, losses = evaluate_vs_opponent(
@@ -1001,6 +1040,7 @@ def play(args: argparse.Namespace) -> None:
         arg_board_size=args.board_size,
         arg_win_length=args.win_length,
         arg_channels=args.channels,
+        arg_conv_layers=args.conv_layers,
         device=device,
     )
     env = GomokuEnv(board_size=board_size, win_length=win_length)
@@ -1058,6 +1098,7 @@ def gui(args: argparse.Namespace) -> None:
         arg_board_size=args.board_size,
         arg_win_length=args.win_length,
         arg_channels=args.channels,
+        arg_conv_layers=args.conv_layers,
         device=device,
     )
     env = GomokuEnv(board_size=board_size, win_length=win_length)
@@ -1209,7 +1250,8 @@ def build_parser() -> argparse.ArgumentParser:
         win_default = None if defaults_from_checkpoint else 5
         subparser.add_argument("--board-size", type=int, default=board_default)
         subparser.add_argument("--win-length", type=int, default=win_default)
-        subparser.add_argument("--channels", type=int, default=64)
+        subparser.add_argument("--channels", type=int, default=320)
+        subparser.add_argument("--conv-layers", type=int, default=12)
         subparser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
         subparser.add_argument("--checkpoint", type=Path, default=Path("gomoku_mcts.pt"))
 
@@ -1243,6 +1285,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--eval-trace-max-moves", type=int, default=20)
     train_parser.add_argument("--log-every-games", type=int, default=0)
     train_parser.add_argument("--log-every-train-steps", type=int, default=0)
+    train_parser.add_argument("--early-stop-loss", type=float, default=0.0)
+    train_parser.add_argument("--early-stop-patience", type=int, default=0)
+    train_parser.add_argument("--early-stop-min-iterations", type=int, default=0)
     train_parser.add_argument("--save-every", type=int, default=10)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--init-checkpoint", type=Path, default=None)

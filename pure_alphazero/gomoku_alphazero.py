@@ -185,6 +185,73 @@ def apply_action_to_board(
     return next_board, -current_player, False, 0
 
 
+def opening_region_sets(board_size: int) -> tuple[set[int], set[int]]:
+    center = (board_size - 1) / 2.0
+    outer_threshold = max(2.5, board_size * 0.32)
+    center_threshold = max(1.5, board_size * 0.18)
+    outer_actions: set[int] = set()
+    non_center_actions: set[int] = set()
+    for row in range(board_size):
+        for col in range(board_size):
+            dist = abs(row - center) + abs(col - center)
+            action = coords_to_action(row, col, board_size)
+            if dist >= outer_threshold:
+                outer_actions.add(action)
+            if dist >= center_threshold:
+                non_center_actions.add(action)
+    return outer_actions, non_center_actions
+
+
+def nearby_legal_actions(board: np.ndarray, radius: int) -> list[int]:
+    board_size = board.shape[0]
+    occupied = np.argwhere(board != 0)
+    if len(occupied) == 0:
+        return []
+    candidates: set[int] = set()
+    for row, col in occupied:
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                rr = int(row) + dr
+                cc = int(col) + dc
+                if 0 <= rr < board_size and 0 <= cc < board_size and board[rr, cc] == 0:
+                    candidates.add(coords_to_action(rr, cc, board_size))
+    return sorted(candidates)
+
+
+def sample_diverse_opening_action(
+    board: np.ndarray,
+    outer_ring_prob: float,
+    non_center_prob: float,
+    neighbor_radius: int,
+) -> int:
+    legal_actions = [int(action) for action in np.flatnonzero((board == 0).reshape(-1))]
+    if not legal_actions:
+        raise RuntimeError("no legal opening actions available")
+
+    board_size = board.shape[0]
+    outer_actions, non_center_actions = opening_region_sets(board_size)
+    nearby_actions = nearby_legal_actions(board, neighbor_radius)
+
+    legal_outer = [action for action in legal_actions if action in outer_actions]
+    legal_non_center = [action for action in legal_actions if action in non_center_actions]
+    legal_nearby_outer = [action for action in nearby_actions if action in outer_actions]
+    legal_nearby_non_center = [action for action in nearby_actions if action in non_center_actions]
+
+    if np.any(board != 0):
+        if legal_nearby_outer and random.random() < outer_ring_prob:
+            return int(random.choice(legal_nearby_outer))
+        if legal_nearby_non_center and random.random() < non_center_prob:
+            return int(random.choice(legal_nearby_non_center))
+        if nearby_actions:
+            return int(random.choice(nearby_actions))
+
+    if legal_outer and random.random() < outer_ring_prob:
+        return int(random.choice(legal_outer))
+    if legal_non_center and random.random() < non_center_prob:
+        return int(random.choice(legal_non_center))
+    return int(random.choice(legal_actions))
+
+
 def encode_state(board: np.ndarray, current_player: int) -> torch.Tensor:
     current = (board == current_player).astype(np.float32)
     opponent = (board == -current_player).astype(np.float32)
@@ -548,6 +615,10 @@ def self_play_game(
     dirichlet_alpha: float,
     noise_eps: float,
     random_opening_moves: int,
+    opening_sampler: str,
+    opening_outer_ring_prob: float,
+    opening_non_center_prob: float,
+    opening_neighbor_radius: int,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray, float]], int, int]:
     env = GomokuEnv(board_size=board_size, win_length=win_length)
     env.reset()
@@ -557,7 +628,16 @@ def self_play_game(
     for _ in range(opening_moves):
         if env.done:
             break
-        env.step(int(np.random.choice(env.valid_moves())))
+        if opening_sampler == "diverse":
+            action = sample_diverse_opening_action(
+                env.board,
+                outer_ring_prob=opening_outer_ring_prob,
+                non_center_prob=opening_non_center_prob,
+                neighbor_radius=opening_neighbor_radius,
+            )
+        else:
+            action = int(np.random.choice(env.valid_moves()))
+        env.step(action)
         move_idx += 1
 
     while not env.done:
@@ -929,6 +1009,10 @@ def train(args: argparse.Namespace) -> None:
                 dirichlet_alpha=args.dirichlet_alpha,
                 noise_eps=args.noise_eps,
                 random_opening_moves=args.random_opening_moves,
+                opening_sampler=args.opening_sampler,
+                opening_outer_ring_prob=args.opening_outer_ring_prob,
+                opening_non_center_prob=args.opening_non_center_prob,
+                opening_neighbor_radius=args.opening_neighbor_radius,
             )
             replay_buffer.extend(game_examples)
             winners.append(winner)
@@ -1194,6 +1278,10 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--dirichlet-alpha", type=float, default=0.08)
     train_parser.add_argument("--noise-eps", type=float, default=0.10)
     train_parser.add_argument("--random-opening-moves", type=int, default=1)
+    train_parser.add_argument("--opening-sampler", choices=["uniform", "diverse"], default="uniform")
+    train_parser.add_argument("--opening-outer-ring-prob", type=float, default=0.35)
+    train_parser.add_argument("--opening-non-center-prob", type=float, default=0.70)
+    train_parser.add_argument("--opening-neighbor-radius", type=int, default=2)
     train_parser.add_argument("--eval-every", type=int, default=10)
     train_parser.add_argument("--eval-games", type=int, default=20)
     train_parser.add_argument("--eval-heuristic-games", type=int, default=8)

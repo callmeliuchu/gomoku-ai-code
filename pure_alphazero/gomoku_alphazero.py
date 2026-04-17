@@ -1047,6 +1047,7 @@ def train(args: argparse.Namespace) -> None:
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     replay_buffer: deque[tuple[np.ndarray, np.ndarray, float]] = deque(maxlen=args.buffer_size)
     early_stop_hits = 0
+    heuristic_stop_hits = 0
     params = count_parameters(policy)
     print(
         f"device={device} board={args.board_size} win={args.win_length} "
@@ -1133,6 +1134,17 @@ def train(args: argparse.Namespace) -> None:
                     c_puct=args.c_puct,
                 )
                 message += f" heuristic_win_rate={heuristic_win_rate:.3f} ({hwins}/{hdraws}/{hlosses})"
+                if (
+                    args.early_stop_heuristic_win_rate > 0.0
+                    and iteration >= args.early_stop_min_iterations
+                    and heuristic_win_rate >= args.early_stop_heuristic_win_rate
+                ):
+                    heuristic_stop_hits += 1
+                    message += (
+                        f" heuristic_stop_hits={heuristic_stop_hits}/{args.early_stop_heuristic_patience}"
+                    )
+                elif args.early_stop_heuristic_win_rate > 0.0:
+                    heuristic_stop_hits = 0
         print(message)
 
         if args.eval_every > 0 and iteration % args.eval_every == 0:
@@ -1207,6 +1219,19 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"early_stop triggered at iter={iteration} "
                 f"avg_loss={avg_loss:.4f} threshold={args.early_stop_loss:.4f}"
+            )
+            print(f"saved checkpoint to {args.checkpoint}")
+            return
+
+        if (
+            args.early_stop_heuristic_win_rate > 0.0
+            and args.early_stop_heuristic_patience > 0
+            and heuristic_stop_hits >= args.early_stop_heuristic_patience
+        ):
+            save_checkpoint(args.checkpoint, policy, args)
+            print(
+                f"early_stop heuristic triggered at iter={iteration} "
+                f"threshold={args.early_stop_heuristic_win_rate:.3f}"
             )
             print(f"saved checkpoint to {args.checkpoint}")
             return
@@ -1311,6 +1336,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--early-stop-loss", type=float, default=0.0)
     train_parser.add_argument("--early-stop-patience", type=int, default=0)
     train_parser.add_argument("--early-stop-min-iterations", type=int, default=0)
+    train_parser.add_argument("--early-stop-heuristic-win-rate", type=float, default=0.0)
+    train_parser.add_argument("--early-stop-heuristic-patience", type=int, default=0)
     train_parser.add_argument("--selfplay-workers", type=int, default=1)
     train_parser.add_argument("--selfplay-worker-device", choices=["cpu", "cuda", "mps"], default="cpu")
     train_parser.add_argument("--seed", type=int, default=42)

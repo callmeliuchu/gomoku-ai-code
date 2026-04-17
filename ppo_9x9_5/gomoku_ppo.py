@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone Gomoku PPO training focused on 9x9 connect-5."""
+"""Standalone Gomoku PPO training with curriculum-friendly defaults."""
 
 from __future__ import annotations
 
@@ -1009,7 +1009,7 @@ def play(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Standalone Gomoku PPO trainer for 9x9 connect-5")
+    parser = argparse.ArgumentParser(description="Standalone Gomoku PPO trainer")
     subparsers = parser.add_subparsers(dest="mode", required=True)
 
     def add_common_arguments(subparser: argparse.ArgumentParser, defaults_from_checkpoint: bool = False) -> None:
@@ -1020,7 +1020,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--channels", type=int, default=128)
         subparser.add_argument("--conv-layers", type=int, default=8)
         subparser.add_argument("--device", type=str, default="auto")
-        subparser.add_argument("--checkpoint", type=Path, default=Path("gomoku_ppo_9x9_5.pt"))
+        subparser.add_argument("--checkpoint", type=Path, default=Path("gomoku_ppo.pt"))
 
     train_parser = subparsers.add_parser("train", help="self-play PPO training")
     add_common_arguments(train_parser)

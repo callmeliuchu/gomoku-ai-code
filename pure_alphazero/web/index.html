@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pure AlphaZero Gomoku</title>
+  <style>
+    :root {
+      --bg: #f4efe5;
+      --panel: #fffaf0;
+      --line: #3a2d20;
+      --muted: #6b6258;
+      --accent: #af3d2a;
+      --stone-x: #111111;
+      --stone-o: #f7f7f7;
+    }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #faf4e9, var(--bg));
+      color: #1d1916;
+    }
+    .page {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 24px 16px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    .sub {
+      color: var(--muted);
+      margin-bottom: 18px;
+    }
+    .controls, .side {
+      background: var(--panel);
+      border: 1px solid #d9cbb3;
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(58, 45, 32, 0.08);
+    }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px 16px;
+      margin-bottom: 18px;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(320px, 1fr) 320px;
+      gap: 18px;
+    }
+    .board-wrap {
+      background: #d7b36f;
+      border-radius: 18px;
+      padding: 14px;
+      border: 1px solid #b18b52;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.3);
+    }
+    .board {
+      display: grid;
+      gap: 2px;
+      aspect-ratio: 1 / 1;
+      width: 100%;
+      background: rgba(58, 45, 32, 0.18);
+    }
+    .cell {
+      position: relative;
+      background: rgba(255, 246, 224, 0.22);
+      border: none;
+      cursor: pointer;
+      min-width: 0;
+      min-height: 0;
+    }
+    .cell:hover {
+      background: rgba(255, 255, 255, 0.28);
+    }
+    .cell:disabled {
+      cursor: default;
+    }
+    .stone {
+      position: absolute;
+      inset: 12%;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      font-weight: 700;
+      font-size: clamp(18px, 2vw, 24px);
+      border: 1px solid rgba(0,0,0,0.2);
+    }
+    .stone.x {
+      background: radial-gradient(circle at 30% 25%, #4a4a4a, var(--stone-x));
+      color: white;
+    }
+    .stone.o {
+      background: radial-gradient(circle at 30% 25%, white, #d9d9d9);
+      color: #111;
+    }
+    .info-block {
+      margin-bottom: 14px;
+    }
+    .label {
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .status {
+      font-size: 18px;
+      font-weight: 600;
+    }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 13px;
+      line-height: 1.45;
+      color: #2d261f;
+    }
+    button, select {
+      font: inherit;
+    }
+    .primary {
+      background: var(--accent);
+      color: white;
+      border: none;
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+    }
+    @media (max-width: 900px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Pure AlphaZero Gomoku</h1>
+    <div class="sub">最小网页对战版。可选先手/后手，直接和当前模型下棋。</div>
+
+    <div class="controls">
+      <label>
+        你先手：
+        <select id="firstMove">
+          <option value="true">是（你执 X）</option>
+          <option value="false">否（模型执 X）</option>
+        </select>
+      </label>
+      <button class="primary" id="newGameBtn">New Game</button>
+      <div class="hint" id="meta"></div>
+    </div>
+
+    <div class="layout">
+      <div class="board-wrap">
+        <div id="board" class="board"></div>
+      </div>
+      <div class="side">
+        <div class="info-block">
+          <div class="label">Status</div>
+          <div class="status" id="status">Loading...</div>
+        </div>
+        <div class="info-block">
+          <div class="label">Moves</div>
+          <pre id="moves"></pre>
+        </div>
+        <div class="info-block">
+          <div class="label">Board Text</div>
+          <pre id="boardText"></pre>
+        </div>
+        <div class="info-block">
+          <div class="label">Error</div>
+          <pre id="errorText"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const boardEl = document.getElementById("board");
+    const statusEl = document.getElementById("status");
+    const movesEl = document.getElementById("moves");
+    const boardTextEl = document.getElementById("boardText");
+    const errorTextEl = document.getElementById("errorText");
+    const metaEl = document.getElementById("meta");
+    const firstMoveEl = document.getElementById("firstMove");
+    const newGameBtn = document.getElementById("newGameBtn");
+
+    let config = null;
+    let state = null;
+
+    async function getJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+      return await res.json();
+    }
+
+    async function postJSON(url, payload) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+      return await res.json();
+    }
+
+    function renderBoard() {
+      if (!state) return;
+      boardEl.innerHTML = "";
+      boardEl.style.gridTemplateColumns = `repeat(${state.board_size}, 1fr)`;
+      state.board.forEach((row, rowIndex) => {
+        row.forEach((cell, colIndex) => {
+          const button = document.createElement("button");
+          button.className = "cell";
+          button.disabled = Boolean(cell !== 0 || state.done || state.current_player !== state.human_player);
+          button.addEventListener("click", () => playMove(rowIndex, colIndex));
+          if (cell === 1 || cell === -1) {
+            const stone = document.createElement("div");
+            stone.className = `stone ${cell === 1 ? "x" : "o"}`;
+            stone.textContent = cell === 1 ? "X" : "O";
+            button.appendChild(stone);
+          }
+          boardEl.appendChild(button);
+        });
+      });
+    }
+
+    function renderState() {
+      if (!state) return;
+      statusEl.textContent = state.status;
+      movesEl.textContent = state.history_text || "(empty)";
+      boardTextEl.textContent = state.board_text || "";
+      errorTextEl.textContent = state.last_error || "";
+      renderBoard();
+    }
+
+    async function refreshState() {
+      state = await getJSON("/api/state");
+      renderState();
+    }
+
+    async function playMove(row, col) {
+      state = await postJSON("/api/move", { row, col });
+      renderState();
+    }
+
+    async function newGame() {
+      state = await postJSON("/api/new_game", { human_first: firstMoveEl.value === "true" });
+      renderState();
+    }
+
+    async function init() {
+      config = await getJSON("/api/config");
+      metaEl.textContent = `${config.board_size}x${config.board_size} connect-${config.win_length} | ${config.agent} | ${config.device} | ${config.params} params`;
+      await refreshState();
+    }
+
+    newGameBtn.addEventListener("click", newGame);
+    init().catch((err) => {
+      statusEl.textContent = "Failed to load.";
+      errorTextEl.textContent = String(err);
+    });
+  </script>
+</body>
+</html>

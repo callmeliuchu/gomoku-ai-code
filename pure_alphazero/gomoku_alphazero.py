@@ -4,11 +4,8 @@
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import math
-import multiprocessing as mp
 import random
-import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -686,146 +683,6 @@ def resolve_game_config(
     return policy, board_size, win_length
 
 
-@dataclass
-class SelfPlayWorkerResult:
-    examples: list[tuple[np.ndarray, np.ndarray, float]]
-    winners: list[int]
-    lengths: list[int]
-
-
-def self_play_worker(
-    checkpoint_path: str,
-    board_size: int,
-    win_length: int,
-    channels: int,
-    conv_layers: int,
-    device_name: str,
-    games: int,
-    mcts_sims: int,
-    c_puct: float,
-    temperature: float,
-    temperature_drop_moves: int,
-    dirichlet_alpha: float,
-    noise_eps: float,
-    random_opening_moves: int,
-    seed: int,
-) -> SelfPlayWorkerResult:
-    set_seed(seed)
-    device = choose_device(device_name)
-    checkpoint = load_checkpoint(Path(checkpoint_path), map_location=device)
-    policy = build_policy(channels, conv_layers, device, checkpoint=checkpoint)
-    policy.eval()
-    examples: list[tuple[np.ndarray, np.ndarray, float]] = []
-    winners: list[int] = []
-    lengths: list[int] = []
-    for _ in range(games):
-        game_examples, winner, moves = self_play_game(
-            policy=policy,
-            board_size=board_size,
-            win_length=win_length,
-            device=device,
-            mcts_sims=mcts_sims,
-            c_puct=c_puct,
-            temperature=temperature,
-            temperature_drop_moves=temperature_drop_moves,
-            dirichlet_alpha=dirichlet_alpha,
-            noise_eps=noise_eps,
-            random_opening_moves=random_opening_moves,
-        )
-        examples.extend(game_examples)
-        winners.append(winner)
-        lengths.append(moves)
-    return SelfPlayWorkerResult(examples=examples, winners=winners, lengths=lengths)
-
-
-def collect_self_play_examples(
-    policy: PolicyValueNet,
-    args: argparse.Namespace,
-    device: torch.device,
-    iteration: int,
-) -> SelfPlayWorkerResult:
-    if args.selfplay_workers <= 1:
-        examples: list[tuple[np.ndarray, np.ndarray, float]] = []
-        winners: list[int] = []
-        lengths: list[int] = []
-        for _ in range(args.games_per_iter):
-            game_examples, winner, moves = self_play_game(
-                policy=policy,
-                board_size=args.board_size,
-                win_length=args.win_length,
-                device=device,
-                mcts_sims=args.mcts_sims,
-                c_puct=args.c_puct,
-                temperature=args.temperature,
-                temperature_drop_moves=args.temperature_drop_moves,
-                dirichlet_alpha=args.dirichlet_alpha,
-                noise_eps=args.noise_eps,
-                random_opening_moves=args.random_opening_moves,
-            )
-            examples.extend(game_examples)
-            winners.append(winner)
-            lengths.append(moves)
-        return SelfPlayWorkerResult(examples=examples, winners=winners, lengths=lengths)
-
-    worker_games = [args.games_per_iter // args.selfplay_workers] * args.selfplay_workers
-    for index in range(args.games_per_iter % args.selfplay_workers):
-        worker_games[index] += 1
-    worker_games = [count for count in worker_games if count > 0]
-
-    with tempfile.NamedTemporaryFile(prefix="alphazero_snapshot_", suffix=".pt", delete=False) as tmp_file:
-        temp_checkpoint = Path(tmp_file.name)
-    torch.save(
-        {
-            "state_dict": policy.state_dict(),
-            "channels": args.channels,
-            "conv_layers": args.conv_layers,
-            "board_size": args.board_size,
-            "win_length": args.win_length,
-        },
-        temp_checkpoint,
-    )
-
-    examples: list[tuple[np.ndarray, np.ndarray, float]] = []
-    winners: list[int] = []
-    lengths: list[int] = []
-    ctx = mp.get_context("spawn")
-    try:
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=len(worker_games),
-            mp_context=ctx,
-        ) as executor:
-            futures = []
-            for worker_index, games in enumerate(worker_games):
-                futures.append(
-                    executor.submit(
-                        self_play_worker,
-                        str(temp_checkpoint),
-                        args.board_size,
-                        args.win_length,
-                        args.channels,
-                        args.conv_layers,
-                        args.selfplay_worker_device,
-                        games,
-                        args.mcts_sims,
-                        args.c_puct,
-                        args.temperature,
-                        args.temperature_drop_moves,
-                        args.dirichlet_alpha,
-                        args.noise_eps,
-                        args.random_opening_moves,
-                        args.seed + iteration * 1000 + worker_index,
-                    )
-                )
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                examples.extend(result.examples)
-                winners.extend(result.winners)
-                lengths.extend(result.lengths)
-    finally:
-        temp_checkpoint.unlink(missing_ok=True)
-    return SelfPlayWorkerResult(examples=examples, winners=winners, lengths=lengths)
-
-
 def choose_opponent_action(board: np.ndarray, current_player: int, win_length: int, opponent: str) -> int:
     if opponent == "random":
         return int(np.random.choice(np.flatnonzero((board == 0).reshape(-1))))
@@ -1051,25 +908,39 @@ def train(args: argparse.Namespace) -> None:
     params = count_parameters(policy)
     print(
         f"device={device} board={args.board_size} win={args.win_length} "
-        f"params={params} approx_mib={parameter_size_mib(params):.2f} "
-        f"selfplay_workers={args.selfplay_workers}"
+        f"params={params} approx_mib={parameter_size_mib(params):.2f}"
     )
 
     for iteration in range(1, args.iterations + 1):
         policy.eval()
         iteration_start = time.perf_counter()
-        self_play = collect_self_play_examples(policy=policy, args=args, device=device, iteration=iteration)
-        replay_buffer.extend(self_play.examples)
-        winners = self_play.winners
-        lengths = self_play.lengths
-        games_done = len(winners)
-        if args.log_every_games > 0 and games_done > 0:
-            avg_len = float(np.mean(lengths)) if lengths else 0.0
-            elapsed = time.perf_counter() - iteration_start
-            print(
-                f"iter={iteration:5d} selfplay={games_done:3d}/{args.games_per_iter:3d} "
-                f"avg_len={avg_len:6.2f} buffer={len(replay_buffer):6d} elapsed={elapsed:7.1f}s"
+        winners: list[int] = []
+        lengths: list[int] = []
+        for _ in range(args.games_per_iter):
+            game_examples, winner, moves = self_play_game(
+                policy=policy,
+                board_size=args.board_size,
+                win_length=args.win_length,
+                device=device,
+                mcts_sims=args.mcts_sims,
+                c_puct=args.c_puct,
+                temperature=args.temperature,
+                temperature_drop_moves=args.temperature_drop_moves,
+                dirichlet_alpha=args.dirichlet_alpha,
+                noise_eps=args.noise_eps,
+                random_opening_moves=args.random_opening_moves,
             )
+            replay_buffer.extend(game_examples)
+            winners.append(winner)
+            lengths.append(moves)
+            games_done = len(winners)
+            if args.log_every_games > 0 and games_done % args.log_every_games == 0:
+                avg_len = float(np.mean(lengths)) if lengths else 0.0
+                elapsed = time.perf_counter() - iteration_start
+                print(
+                    f"iter={iteration:5d} selfplay={games_done:3d}/{args.games_per_iter:3d} "
+                    f"avg_len={avg_len:6.2f} buffer={len(replay_buffer):6d} elapsed={elapsed:7.1f}s"
+                )
 
         losses: list[tuple[float, float, float]] = []
         if len(replay_buffer) >= args.batch_size:
@@ -1338,8 +1209,6 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--early-stop-min-iterations", type=int, default=0)
     train_parser.add_argument("--early-stop-heuristic-win-rate", type=float, default=0.0)
     train_parser.add_argument("--early-stop-heuristic-patience", type=int, default=0)
-    train_parser.add_argument("--selfplay-workers", type=int, default=1)
-    train_parser.add_argument("--selfplay-worker-device", choices=["cpu", "cuda", "mps"], default="cpu")
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--init-checkpoint", type=Path, default=None)
     train_parser.set_defaults(func=train)

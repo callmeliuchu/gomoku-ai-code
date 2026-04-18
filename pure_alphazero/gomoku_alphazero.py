@@ -9,11 +9,15 @@ import random
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
+
+
+THREAT_BUCKETS = ("center", "near_edge", "edge")
 
 
 def choose_device(name: str) -> torch.device:
@@ -250,6 +254,196 @@ def sample_diverse_opening_action(
     if legal_non_center and random.random() < non_center_prob:
         return int(random.choice(legal_non_center))
     return int(random.choice(legal_actions))
+
+
+@dataclass(frozen=True)
+class ThreatCase:
+    opening_actions: tuple[int, ...]
+    required_blocks: tuple[int, ...]
+    description: str
+    bucket: str
+
+
+def choose_distant_filler_actions(
+    board_size: int,
+    forbidden_cells: set[tuple[int, int]],
+    reference_cells: tuple[tuple[int, int], ...],
+    count: int,
+) -> list[int]:
+    candidates: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for row in range(board_size):
+        for col in range(board_size):
+            cell = (row, col)
+            if cell in forbidden_cells:
+                continue
+            distance = min(abs(row - rr) + abs(col - cc) for rr, cc in reference_cells)
+            # Prefer cells far from the threat band so the prefix teaches defense, not filler tactics.
+            candidates.append(((-distance, -abs(row - col)), cell))
+    candidates.sort()
+    return [coords_to_action(row, col, board_size) for _, (row, col) in candidates[:count]]
+
+
+def build_threat_case(
+    board_size: int,
+    blocker_cell: tuple[int, int],
+    attacker_cells: tuple[tuple[int, int], ...],
+    block_cell: tuple[int, int],
+    description: str,
+) -> ThreatCase | None:
+    defender_fillers_needed = len(attacker_cells) - 1
+    forbidden_cells = {blocker_cell, block_cell, *attacker_cells}
+    reference_cells = (blocker_cell, block_cell, *attacker_cells)
+    filler_actions = choose_distant_filler_actions(
+        board_size=board_size,
+        forbidden_cells=forbidden_cells,
+        reference_cells=reference_cells,
+        count=defender_fillers_needed,
+    )
+    if len(filler_actions) != defender_fillers_needed:
+        return None
+
+    opening_actions = [coords_to_action(*blocker_cell, board_size), coords_to_action(*attacker_cells[0], board_size)]
+    for filler_action, attacker_cell in zip(filler_actions, attacker_cells[1:], strict=False):
+        opening_actions.append(filler_action)
+        opening_actions.append(coords_to_action(*attacker_cell, board_size))
+
+    threat_cells = (blocker_cell, *attacker_cells, block_cell)
+    return ThreatCase(
+        opening_actions=tuple(opening_actions),
+        required_blocks=(coords_to_action(*block_cell, board_size),),
+        description=description,
+        bucket=classify_threat_bucket(board_size, threat_cells),
+    )
+
+
+@lru_cache(maxsize=None)
+def threat_cases(board_size: int, win_length: int) -> tuple[ThreatCase, ...]:
+    if board_size < win_length + 1:
+        return ()
+
+    cases: list[ThreatCase] = []
+    segment_length = win_length + 1
+    directions = ((0, 1, "h"), (1, 0, "v"), (1, 1, "d"), (1, -1, "a"))
+
+    for dr, dc, label in directions:
+        for row in range(board_size):
+            for col in range(board_size):
+                end_row = row + (segment_length - 1) * dr
+                end_col = col + (segment_length - 1) * dc
+                if not (0 <= end_row < board_size and 0 <= end_col < board_size):
+                    continue
+
+                cells = tuple((row + idx * dr, col + idx * dc) for idx in range(segment_length))
+                forward_case = build_threat_case(
+                    board_size=board_size,
+                    blocker_cell=cells[0],
+                    attacker_cells=cells[1:-1],
+                    block_cell=cells[-1],
+                    description=f"{label}-{row}-{col}-f",
+                )
+                reverse_case = build_threat_case(
+                    board_size=board_size,
+                    blocker_cell=cells[-1],
+                    attacker_cells=tuple(reversed(cells[1:-1])),
+                    block_cell=cells[0],
+                    description=f"{label}-{row}-{col}-r",
+                )
+                for case in (forward_case, reverse_case):
+                    if case is not None:
+                        cases.append(case)
+
+    return tuple(cases)
+
+
+def edge_distance(board_size: int, row: int, col: int) -> int:
+    return min(row, col, board_size - 1 - row, board_size - 1 - col)
+
+
+def classify_threat_bucket(board_size: int, cells: tuple[tuple[int, int], ...]) -> str:
+    min_distance = min(edge_distance(board_size, row, col) for row, col in cells)
+    if min_distance == 0:
+        return "edge"
+    if min_distance == 1:
+        return "near_edge"
+    return "center"
+
+
+def threat_case_groups(board_size: int, win_length: int) -> dict[str, list[ThreatCase]]:
+    groups = {bucket: [] for bucket in THREAT_BUCKETS}
+    for case in threat_cases(board_size=board_size, win_length=win_length):
+        groups[case.bucket].append(case)
+    return groups
+
+
+def choose_weighted_threat_case(
+    board_size: int,
+    win_length: int,
+    center_weight: float,
+    near_edge_weight: float,
+    edge_weight: float,
+) -> ThreatCase | None:
+    groups = threat_case_groups(board_size=board_size, win_length=win_length)
+    weights_by_bucket = {
+        "center": max(center_weight, 0.0),
+        "near_edge": max(near_edge_weight, 0.0),
+        "edge": max(edge_weight, 0.0),
+    }
+    available_buckets = [bucket for bucket in THREAT_BUCKETS if groups[bucket] and weights_by_bucket[bucket] > 0.0]
+    if not available_buckets:
+        all_cases = [case for bucket in THREAT_BUCKETS for case in groups[bucket]]
+        if not all_cases:
+            return None
+        return random.choice(all_cases)
+
+    bucket = random.choices(
+        available_buckets,
+        weights=[weights_by_bucket[bucket] for bucket in available_buckets],
+        k=1,
+    )[0]
+    return random.choice(groups[bucket])
+
+
+def select_stratified_threat_cases(
+    board_size: int,
+    win_length: int,
+    max_cases: int,
+    seed: int = 0,
+) -> list[ThreatCase]:
+    if max_cases <= 0:
+        return []
+
+    groups = threat_case_groups(board_size=board_size, win_length=win_length)
+    rng = random.Random(seed)
+    shuffled_groups: dict[str, list[ThreatCase]] = {}
+    for bucket in THREAT_BUCKETS:
+        bucket_cases = groups[bucket][:]
+        rng.shuffle(bucket_cases)
+        shuffled_groups[bucket] = bucket_cases
+
+    all_cases = [case for bucket in THREAT_BUCKETS for case in shuffled_groups[bucket]]
+    if len(all_cases) <= max_cases:
+        return all_cases
+
+    selected: list[ThreatCase] = []
+    while len(selected) < max_cases:
+        progressed = False
+        for bucket in THREAT_BUCKETS:
+            if shuffled_groups[bucket] and len(selected) < max_cases:
+                selected.append(shuffled_groups[bucket].pop())
+                progressed = True
+        if not progressed:
+            break
+    return selected
+
+
+def play_opening_actions(env: GomokuEnv, opening_actions: tuple[int, ...]) -> int:
+    moves_played = 0
+    for action in opening_actions:
+        if env.done:
+            break
+        env.step(action)
+        moves_played += 1
+    return moves_played
 
 
 def encode_state(board: np.ndarray, current_player: int) -> torch.Tensor:
@@ -619,26 +813,42 @@ def self_play_game(
     opening_outer_ring_prob: float,
     opening_non_center_prob: float,
     opening_neighbor_radius: int,
+    threat_opening_prob: float,
+    threat_center_weight: float,
+    threat_near_edge_weight: float,
+    threat_edge_weight: float,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray, float]], int, int]:
     env = GomokuEnv(board_size=board_size, win_length=win_length)
     env.reset()
     history: list[tuple[np.ndarray, np.ndarray, int]] = []
     move_idx = 0
-    opening_moves = random.randint(0, max(random_opening_moves, 0))
-    for _ in range(opening_moves):
-        if env.done:
-            break
-        if opening_sampler == "diverse":
-            action = sample_diverse_opening_action(
-                env.board,
-                outer_ring_prob=opening_outer_ring_prob,
-                non_center_prob=opening_non_center_prob,
-                neighbor_radius=opening_neighbor_radius,
-            )
-        else:
-            action = int(np.random.choice(env.valid_moves()))
-        env.step(action)
-        move_idx += 1
+    if threat_opening_prob > 0.0 and random.random() < threat_opening_prob:
+        case = choose_weighted_threat_case(
+            board_size=board_size,
+            win_length=win_length,
+            center_weight=threat_center_weight,
+            near_edge_weight=threat_near_edge_weight,
+            edge_weight=threat_edge_weight,
+        )
+        if case is not None:
+            move_idx += play_opening_actions(env, case.opening_actions)
+
+    if move_idx == 0:
+        opening_moves = random.randint(0, max(random_opening_moves, 0))
+        for _ in range(opening_moves):
+            if env.done:
+                break
+            if opening_sampler == "diverse":
+                action = sample_diverse_opening_action(
+                    env.board,
+                    outer_ring_prob=opening_outer_ring_prob,
+                    non_center_prob=opening_non_center_prob,
+                    neighbor_radius=opening_neighbor_radius,
+                )
+            else:
+                action = int(np.random.choice(env.valid_moves()))
+            env.step(action)
+            move_idx += 1
 
     while not env.done:
         move_temp = temperature if move_idx < temperature_drop_moves else 1e-6
@@ -968,6 +1178,53 @@ def evaluate_heuristic_trace(
     return env.winner, moves, board_snapshots, env.render()
 
 
+def evaluate_threat_response_cases(
+    policy: PolicyValueNet,
+    board_size: int,
+    win_length: int,
+    device: torch.device,
+    agent: str,
+    mcts_sims: int,
+    c_puct: float,
+    max_cases: int,
+) -> tuple[float, int, int]:
+    cases = select_stratified_threat_cases(
+        board_size=board_size,
+        win_length=win_length,
+        max_cases=max_cases,
+        seed=0,
+    )
+    if max_cases <= 0 or not cases:
+        return 0.0, 0, 0
+
+    successes = 0
+    for case in cases:
+        env = GomokuEnv(board_size=board_size, win_length=win_length)
+        env.reset()
+        play_opening_actions(env, case.opening_actions)
+        action, _ = choose_ai_action(
+            policy=policy,
+            board=env.board,
+            current_player=env.current_player,
+            win_length=win_length,
+            device=device,
+            agent=agent,
+            mcts_sims=mcts_sims,
+            c_puct=c_puct,
+        )
+        next_board, _, _, _ = apply_action_to_board(
+            board=env.board,
+            current_player=env.current_player,
+            action=action,
+            win_length=win_length,
+        )
+        attacker = -env.current_player
+        remaining_wins = immediate_winning_actions(next_board, attacker, win_length)
+        if action in case.required_blocks and not remaining_wins:
+            successes += 1
+    return successes / len(cases), successes, len(cases)
+
+
 def train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
@@ -985,6 +1242,7 @@ def train(args: argparse.Namespace) -> None:
     replay_buffer: deque[tuple[np.ndarray, np.ndarray, float]] = deque(maxlen=args.buffer_size)
     early_stop_hits = 0
     heuristic_stop_hits = 0
+    threat_stop_hits = 0
     params = count_parameters(policy)
     print(
         f"device={device} board={args.board_size} win={args.win_length} "
@@ -1013,6 +1271,10 @@ def train(args: argparse.Namespace) -> None:
                 opening_outer_ring_prob=args.opening_outer_ring_prob,
                 opening_non_center_prob=args.opening_non_center_prob,
                 opening_neighbor_radius=args.opening_neighbor_radius,
+                threat_opening_prob=args.threat_opening_prob,
+                threat_center_weight=args.threat_center_weight,
+                threat_near_edge_weight=args.threat_near_edge_weight,
+                threat_edge_weight=args.threat_edge_weight,
             )
             replay_buffer.extend(game_examples)
             winners.append(winner)
@@ -1100,6 +1362,27 @@ def train(args: argparse.Namespace) -> None:
                     )
                 elif args.early_stop_heuristic_win_rate > 0.0:
                     heuristic_stop_hits = 0
+            if args.eval_threat_cases > 0:
+                threat_block_rate, threat_blocks, threat_total = evaluate_threat_response_cases(
+                    policy=policy,
+                    board_size=args.board_size,
+                    win_length=args.win_length,
+                    device=device,
+                    agent="mcts",
+                    mcts_sims=args.eval_mcts_sims,
+                    c_puct=args.c_puct,
+                    max_cases=args.eval_threat_cases,
+                )
+                message += f" threat_block_rate={threat_block_rate:.3f} ({threat_blocks}/{threat_total})"
+                if (
+                    args.early_stop_threat_block_rate > 0.0
+                    and iteration >= args.early_stop_min_iterations
+                    and threat_block_rate >= args.early_stop_threat_block_rate
+                ):
+                    threat_stop_hits += 1
+                    message += f" threat_stop_hits={threat_stop_hits}/{args.early_stop_threat_patience}"
+                elif args.early_stop_threat_block_rate > 0.0:
+                    threat_stop_hits = 0
         print(message)
 
         if args.eval_every > 0 and iteration % args.eval_every == 0:
@@ -1191,6 +1474,19 @@ def train(args: argparse.Namespace) -> None:
             print(f"saved checkpoint to {args.checkpoint}")
             return
 
+        if (
+            args.early_stop_threat_block_rate > 0.0
+            and args.early_stop_threat_patience > 0
+            and threat_stop_hits >= args.early_stop_threat_patience
+        ):
+            save_checkpoint(args.checkpoint, policy, args)
+            print(
+                f"early_stop threat defense triggered at iter={iteration} "
+                f"threshold={args.early_stop_threat_block_rate:.3f}"
+            )
+            print(f"saved checkpoint to {args.checkpoint}")
+            return
+
     save_checkpoint(args.checkpoint, policy, args)
     print(f"saved checkpoint to {args.checkpoint}")
 
@@ -1221,6 +1517,18 @@ def evaluate(args: argparse.Namespace) -> None:
         f"agent={args.agent} opponent={args.opponent} mcts_sims={args.mcts_sims} "
         f"win_rate={win_rate:.3f} wins={wins} draws={draws} losses={losses}"
     )
+    if args.threat_response_cases > 0:
+        threat_block_rate, threat_blocks, threat_total = evaluate_threat_response_cases(
+            policy=policy,
+            board_size=board_size,
+            win_length=win_length,
+            device=device,
+            agent=args.agent,
+            mcts_sims=args.mcts_sims,
+            c_puct=args.c_puct,
+            max_cases=args.threat_response_cases,
+        )
+        print(f"threat_block_rate={threat_block_rate:.3f} blocks={threat_blocks}/{threat_total}")
     if args.trace_games > 0 and args.opponent == "heuristic":
         for trace_index in range(args.trace_games):
             policy_player = 1 if trace_index % 2 == 0 else -1
@@ -1282,9 +1590,14 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--opening-outer-ring-prob", type=float, default=0.35)
     train_parser.add_argument("--opening-non-center-prob", type=float, default=0.70)
     train_parser.add_argument("--opening-neighbor-radius", type=int, default=2)
+    train_parser.add_argument("--threat-opening-prob", type=float, default=0.0)
+    train_parser.add_argument("--threat-center-weight", type=float, default=1.0)
+    train_parser.add_argument("--threat-near-edge-weight", type=float, default=1.0)
+    train_parser.add_argument("--threat-edge-weight", type=float, default=1.0)
     train_parser.add_argument("--eval-every", type=int, default=10)
     train_parser.add_argument("--eval-games", type=int, default=20)
     train_parser.add_argument("--eval-heuristic-games", type=int, default=8)
+    train_parser.add_argument("--eval-threat-cases", type=int, default=0)
     train_parser.add_argument("--eval-trace-games", type=int, default=1)
     train_parser.add_argument("--eval-heuristic-trace-games", type=int, default=1)
     train_parser.add_argument("--eval-trace-max-moves", type=int, default=20)
@@ -1297,6 +1610,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--early-stop-min-iterations", type=int, default=0)
     train_parser.add_argument("--early-stop-heuristic-win-rate", type=float, default=0.0)
     train_parser.add_argument("--early-stop-heuristic-patience", type=int, default=0)
+    train_parser.add_argument("--early-stop-threat-block-rate", type=float, default=0.0)
+    train_parser.add_argument("--early-stop-threat-patience", type=int, default=0)
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--init-checkpoint", type=Path, default=None)
     train_parser.set_defaults(func=train)
@@ -1308,6 +1623,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--agent", choices=["policy", "mcts"], default="mcts")
     eval_parser.add_argument("--mcts-sims", type=int, default=320)
     eval_parser.add_argument("--c-puct", type=float, default=1.5)
+    eval_parser.add_argument("--threat-response-cases", type=int, default=0)
     eval_parser.add_argument("--trace-games", type=int, default=1)
     eval_parser.add_argument("--trace-max-moves", type=int, default=20)
     eval_parser.add_argument("--trace-print-boards", action="store_true")

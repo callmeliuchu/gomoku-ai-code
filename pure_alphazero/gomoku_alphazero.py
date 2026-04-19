@@ -264,6 +264,13 @@ class ThreatCase:
     bucket: str
 
 
+@dataclass(frozen=True)
+class EdgeBuildupCase:
+    opening_actions: tuple[int, ...]
+    description: str
+    stones: int
+
+
 def choose_distant_filler_actions(
     board_size: int,
     forbidden_cells: set[tuple[int, int]],
@@ -444,6 +451,67 @@ def play_opening_actions(env: GomokuEnv, opening_actions: tuple[int, ...]) -> in
         env.step(action)
         moves_played += 1
     return moves_played
+
+
+def build_edge_buildup_case(
+    board_size: int,
+    attacker_cells: tuple[tuple[int, int], ...],
+    description: str,
+) -> EdgeBuildupCase | None:
+    filler_actions = choose_distant_filler_actions(
+        board_size=board_size,
+        forbidden_cells=set(attacker_cells),
+        reference_cells=attacker_cells,
+        count=max(len(attacker_cells) - 1, 0),
+    )
+    if len(filler_actions) != max(len(attacker_cells) - 1, 0):
+        return None
+
+    opening_actions = [coords_to_action(*attacker_cells[0], board_size)]
+    for filler_action, attacker_cell in zip(filler_actions, attacker_cells[1:], strict=False):
+        opening_actions.append(filler_action)
+        opening_actions.append(coords_to_action(*attacker_cell, board_size))
+
+    return EdgeBuildupCase(
+        opening_actions=tuple(opening_actions),
+        description=description,
+        stones=len(attacker_cells),
+    )
+
+
+@lru_cache(maxsize=None)
+def edge_buildup_cases(board_size: int, win_length: int) -> tuple[EdgeBuildupCase, ...]:
+    if board_size < win_length:
+        return ()
+
+    cases: list[EdgeBuildupCase] = []
+    for stones in range(2, win_length):
+        max_offset = board_size - stones
+        for offset in range(max_offset + 1):
+            top = build_edge_buildup_case(
+                board_size=board_size,
+                attacker_cells=tuple((0, offset + idx) for idx in range(stones)),
+                description=f"top-{offset}-{stones}",
+            )
+            bottom = build_edge_buildup_case(
+                board_size=board_size,
+                attacker_cells=tuple((board_size - 1, offset + idx) for idx in range(stones)),
+                description=f"bottom-{offset}-{stones}",
+            )
+            left = build_edge_buildup_case(
+                board_size=board_size,
+                attacker_cells=tuple((offset + idx, 0) for idx in range(stones)),
+                description=f"left-{offset}-{stones}",
+            )
+            right = build_edge_buildup_case(
+                board_size=board_size,
+                attacker_cells=tuple((offset + idx, board_size - 1) for idx in range(stones)),
+                description=f"right-{offset}-{stones}",
+            )
+            for case in (top, bottom, left, right):
+                if case is not None:
+                    cases.append(case)
+    return tuple(cases)
 
 
 def encode_state(board: np.ndarray, current_player: int) -> torch.Tensor:
@@ -813,6 +881,7 @@ def self_play_game(
     opening_outer_ring_prob: float,
     opening_non_center_prob: float,
     opening_neighbor_radius: int,
+    edge_buildup_opening_prob: float,
     threat_opening_prob: float,
     threat_center_weight: float,
     threat_near_edge_weight: float,
@@ -822,7 +891,12 @@ def self_play_game(
     env.reset()
     history: list[tuple[np.ndarray, np.ndarray, int]] = []
     move_idx = 0
-    if threat_opening_prob > 0.0 and random.random() < threat_opening_prob:
+    if edge_buildup_opening_prob > 0.0 and random.random() < edge_buildup_opening_prob:
+        buildup_cases = edge_buildup_cases(board_size=board_size, win_length=win_length)
+        if buildup_cases:
+            move_idx += play_opening_actions(env, random.choice(buildup_cases).opening_actions)
+
+    if move_idx == 0 and threat_opening_prob > 0.0 and random.random() < threat_opening_prob:
         case = choose_weighted_threat_case(
             board_size=board_size,
             win_length=win_length,
@@ -1271,6 +1345,7 @@ def train(args: argparse.Namespace) -> None:
                 opening_outer_ring_prob=args.opening_outer_ring_prob,
                 opening_non_center_prob=args.opening_non_center_prob,
                 opening_neighbor_radius=args.opening_neighbor_radius,
+                edge_buildup_opening_prob=args.edge_buildup_opening_prob,
                 threat_opening_prob=args.threat_opening_prob,
                 threat_center_weight=args.threat_center_weight,
                 threat_near_edge_weight=args.threat_near_edge_weight,
@@ -1590,6 +1665,7 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--opening-outer-ring-prob", type=float, default=0.35)
     train_parser.add_argument("--opening-non-center-prob", type=float, default=0.70)
     train_parser.add_argument("--opening-neighbor-radius", type=int, default=2)
+    train_parser.add_argument("--edge-buildup-opening-prob", type=float, default=0.0)
     train_parser.add_argument("--threat-opening-prob", type=float, default=0.0)
     train_parser.add_argument("--threat-center-weight", type=float, default=1.0)
     train_parser.add_argument("--threat-near-edge-weight", type=float, default=1.0)

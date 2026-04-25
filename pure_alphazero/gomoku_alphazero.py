@@ -8,8 +8,10 @@ import math
 import random
 import time
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
+from multiprocessing import get_context
 from pathlib import Path
 
 import numpy as np
@@ -269,6 +271,35 @@ class EdgeBuildupCase:
     opening_actions: tuple[int, ...]
     description: str
     stones: int
+
+
+@dataclass(frozen=True)
+class SelfPlayWorkerTask:
+    policy_version: int
+    seed: int
+    games: int
+    channels: int
+    conv_layers: int
+    device_name: str
+    state_dict: dict[str, torch.Tensor]
+    board_size: int
+    win_length: int
+    mcts_sims: int
+    c_puct: float
+    temperature: float
+    temperature_drop_moves: int
+    dirichlet_alpha: float
+    noise_eps: float
+    random_opening_moves: int
+    opening_sampler: str
+    opening_outer_ring_prob: float
+    opening_non_center_prob: float
+    opening_neighbor_radius: int
+    edge_buildup_opening_prob: float
+    threat_opening_prob: float
+    threat_center_weight: float
+    threat_near_edge_weight: float
+    threat_edge_weight: float
 
 
 def choose_distant_filler_actions(
@@ -959,6 +990,80 @@ def self_play_game(
     return examples, env.winner, move_idx
 
 
+_SELF_PLAY_WORKER_CACHE: dict[str, object] = {}
+
+
+def clone_state_dict_cpu(policy: PolicyValueNet) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu() for key, value in policy.state_dict().items()}
+
+
+def split_game_counts(total_games: int, workers: int) -> list[int]:
+    if total_games <= 0:
+        return []
+    workers = max(1, min(workers, total_games))
+    base = total_games // workers
+    remainder = total_games % workers
+    counts = [base + (1 if index < remainder else 0) for index in range(workers)]
+    return [count for count in counts if count > 0]
+
+
+def _get_worker_policy(task: SelfPlayWorkerTask) -> tuple[PolicyValueNet, torch.device]:
+    cache_key = (
+        task.policy_version,
+        task.channels,
+        task.conv_layers,
+        task.device_name,
+    )
+    cached_key = _SELF_PLAY_WORKER_CACHE.get("key")
+    if cached_key != cache_key:
+        torch.set_num_threads(1)
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(1)
+        device = choose_device(task.device_name)
+        policy = PolicyValueNet(channels=task.channels, conv_layers=task.conv_layers).to(device)
+        policy.load_state_dict(task.state_dict)
+        policy.eval()
+        _SELF_PLAY_WORKER_CACHE["key"] = cache_key
+        _SELF_PLAY_WORKER_CACHE["policy"] = policy
+        _SELF_PLAY_WORKER_CACHE["device"] = device
+    return _SELF_PLAY_WORKER_CACHE["policy"], _SELF_PLAY_WORKER_CACHE["device"]  # type: ignore[return-value]
+
+
+def self_play_worker(task: SelfPlayWorkerTask) -> tuple[list[tuple[np.ndarray, np.ndarray, float]], list[int], list[int]]:
+    policy, device = _get_worker_policy(task)
+    set_seed(task.seed)
+    all_examples: list[tuple[np.ndarray, np.ndarray, float]] = []
+    winners: list[int] = []
+    lengths: list[int] = []
+    for _ in range(task.games):
+        examples, winner, moves = self_play_game(
+            policy=policy,
+            board_size=task.board_size,
+            win_length=task.win_length,
+            device=device,
+            mcts_sims=task.mcts_sims,
+            c_puct=task.c_puct,
+            temperature=task.temperature,
+            temperature_drop_moves=task.temperature_drop_moves,
+            dirichlet_alpha=task.dirichlet_alpha,
+            noise_eps=task.noise_eps,
+            random_opening_moves=task.random_opening_moves,
+            opening_sampler=task.opening_sampler,
+            opening_outer_ring_prob=task.opening_outer_ring_prob,
+            opening_non_center_prob=task.opening_non_center_prob,
+            opening_neighbor_radius=task.opening_neighbor_radius,
+            edge_buildup_opening_prob=task.edge_buildup_opening_prob,
+            threat_opening_prob=task.threat_opening_prob,
+            threat_center_weight=task.threat_center_weight,
+            threat_near_edge_weight=task.threat_near_edge_weight,
+            threat_edge_weight=task.threat_edge_weight,
+        )
+        all_examples.extend(examples)
+        winners.append(winner)
+        lengths.append(moves)
+    return all_examples, winners, lengths
+
+
 def train_batch(
     policy: PolicyValueNet,
     optimizer: torch.optim.Optimizer,
@@ -1302,6 +1407,7 @@ def evaluate_threat_response_cases(
 def train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
     device = choose_device(args.device)
+    selfplay_device_name = device.type if args.selfplay_device == "same" else args.selfplay_device
     checkpoint = None
     if args.init_checkpoint is not None and args.init_checkpoint.exists():
         checkpoint = load_checkpoint(args.init_checkpoint, map_location=device)
@@ -1320,250 +1426,312 @@ def train(args: argparse.Namespace) -> None:
     params = count_parameters(policy)
     print(
         f"device={device} board={args.board_size} win={args.win_length} "
-        f"params={params} approx_mib={parameter_size_mib(params):.2f}"
+        f"params={params} approx_mib={parameter_size_mib(params):.2f} "
+        f"selfplay_workers={args.selfplay_workers} selfplay_device={selfplay_device_name}"
     )
 
-    for iteration in range(1, args.iterations + 1):
-        policy.eval()
-        iteration_start = time.perf_counter()
-        winners: list[int] = []
-        lengths: list[int] = []
-        for _ in range(args.games_per_iter):
-            game_examples, winner, moves = self_play_game(
-                policy=policy,
-                board_size=args.board_size,
-                win_length=args.win_length,
-                device=device,
-                mcts_sims=args.mcts_sims,
-                c_puct=args.c_puct,
-                temperature=args.temperature,
-                temperature_drop_moves=args.temperature_drop_moves,
-                dirichlet_alpha=args.dirichlet_alpha,
-                noise_eps=args.noise_eps,
-                random_opening_moves=args.random_opening_moves,
-                opening_sampler=args.opening_sampler,
-                opening_outer_ring_prob=args.opening_outer_ring_prob,
-                opening_non_center_prob=args.opening_non_center_prob,
-                opening_neighbor_radius=args.opening_neighbor_radius,
-                edge_buildup_opening_prob=args.edge_buildup_opening_prob,
-                threat_opening_prob=args.threat_opening_prob,
-                threat_center_weight=args.threat_center_weight,
-                threat_near_edge_weight=args.threat_near_edge_weight,
-                threat_edge_weight=args.threat_edge_weight,
+    executor: ProcessPoolExecutor | None = None
+    try:
+        if args.selfplay_workers > 1:
+            executor = ProcessPoolExecutor(
+                max_workers=args.selfplay_workers,
+                mp_context=get_context("spawn"),
             )
-            replay_buffer.extend(game_examples)
-            winners.append(winner)
-            lengths.append(moves)
-            games_done = len(winners)
-            if args.log_every_games > 0 and games_done % args.log_every_games == 0:
-                avg_len = float(np.mean(lengths)) if lengths else 0.0
-                elapsed = time.perf_counter() - iteration_start
-                print(
-                    f"iter={iteration:5d} selfplay={games_done:3d}/{args.games_per_iter:3d} "
-                    f"avg_len={avg_len:6.2f} buffer={len(replay_buffer):6d} elapsed={elapsed:7.1f}s"
-                )
 
-        losses: list[tuple[float, float, float]] = []
-        if len(replay_buffer) >= args.batch_size:
-            policy.train()
-            for step_idx in range(args.train_steps):
-                batch = random.sample(replay_buffer, args.batch_size)
-                losses.append(
-                    train_batch(
-                        policy=policy,
-                        optimizer=optimizer,
-                        batch=batch,
-                        device=device,
-                        value_coef=args.value_coef,
-                    )
-                )
-                if args.log_every_train_steps > 0 and (step_idx + 1) % args.log_every_train_steps == 0:
-                    elapsed = time.perf_counter() - iteration_start
-                    recent_loss, recent_policy, recent_value = losses[-1]
-                    print(
-                        f"iter={iteration:5d} train={step_idx + 1:3d}/{args.train_steps:3d} "
-                        f"loss={recent_loss:7.4f} policy={recent_policy:7.4f} "
-                        f"value={recent_value:7.4f} elapsed={elapsed:7.1f}s"
-                    )
-
-        avg_loss = float(np.mean([item[0] for item in losses])) if losses else 0.0
-        avg_policy_loss = float(np.mean([item[1] for item in losses])) if losses else 0.0
-        avg_value_loss = float(np.mean([item[2] for item in losses])) if losses else 0.0
-        p1_wins = sum(1 for item in winners if item == 1)
-        p2_wins = sum(1 for item in winners if item == -1)
-        draws = sum(1 for item in winners if item == 0)
-        avg_len = float(np.mean(lengths)) if lengths else 0.0
-        message = (
-            f"iter={iteration:5d} loss={avg_loss:7.4f} policy={avg_policy_loss:7.4f} "
-            f"value={avg_value_loss:7.4f} p1={p1_wins:3d} p2={p2_wins:3d} draw={draws:3d} "
-            f"avg_len={avg_len:6.2f} buffer={len(replay_buffer):6d}"
-        )
-
-        if args.eval_every > 0 and iteration % args.eval_every == 0:
+        for iteration in range(1, args.iterations + 1):
             policy.eval()
-            random_win_rate, rwins, rdraws, rlosses = evaluate_vs_opponent(
-                policy=policy,
-                board_size=args.board_size,
-                win_length=args.win_length,
-                device=device,
-                games=args.eval_games,
-                opponent="random",
-                agent="mcts",
-                mcts_sims=args.eval_mcts_sims,
-                c_puct=args.c_puct,
-            )
-            message += f" random_win_rate={random_win_rate:.3f} ({rwins}/{rdraws}/{rlosses})"
-            if args.eval_heuristic_games > 0:
-                heuristic_win_rate, hwins, hdraws, hlosses = evaluate_vs_opponent(
-                    policy=policy,
-                    board_size=args.board_size,
-                    win_length=args.win_length,
-                    device=device,
-                    games=args.eval_heuristic_games,
-                    opponent="heuristic",
-                    agent="mcts",
-                    mcts_sims=args.eval_mcts_sims,
-                    c_puct=args.c_puct,
-                )
-                message += f" heuristic_win_rate={heuristic_win_rate:.3f} ({hwins}/{hdraws}/{hlosses})"
-                if (
-                    args.early_stop_heuristic_win_rate > 0.0
-                    and iteration >= args.early_stop_min_iterations
-                    and heuristic_win_rate >= args.early_stop_heuristic_win_rate
-                ):
-                    heuristic_stop_hits += 1
-                    message += (
-                        f" heuristic_stop_hits={heuristic_stop_hits}/{args.early_stop_heuristic_patience}"
+            iteration_start = time.perf_counter()
+            winners: list[int] = []
+            lengths: list[int] = []
+            next_selfplay_log = args.log_every_games if args.log_every_games > 0 else 0
+
+            if executor is None:
+                for _ in range(args.games_per_iter):
+                    game_examples, winner, moves = self_play_game(
+                        policy=policy,
+                        board_size=args.board_size,
+                        win_length=args.win_length,
+                        device=device,
+                        mcts_sims=args.mcts_sims,
+                        c_puct=args.c_puct,
+                        temperature=args.temperature,
+                        temperature_drop_moves=args.temperature_drop_moves,
+                        dirichlet_alpha=args.dirichlet_alpha,
+                        noise_eps=args.noise_eps,
+                        random_opening_moves=args.random_opening_moves,
+                        opening_sampler=args.opening_sampler,
+                        opening_outer_ring_prob=args.opening_outer_ring_prob,
+                        opening_non_center_prob=args.opening_non_center_prob,
+                        opening_neighbor_radius=args.opening_neighbor_radius,
+                        edge_buildup_opening_prob=args.edge_buildup_opening_prob,
+                        threat_opening_prob=args.threat_opening_prob,
+                        threat_center_weight=args.threat_center_weight,
+                        threat_near_edge_weight=args.threat_near_edge_weight,
+                        threat_edge_weight=args.threat_edge_weight,
                     )
-                elif args.early_stop_heuristic_win_rate > 0.0:
-                    heuristic_stop_hits = 0
-            if args.eval_threat_cases > 0:
-                threat_block_rate, threat_blocks, threat_total = evaluate_threat_response_cases(
+                    replay_buffer.extend(game_examples)
+                    winners.append(winner)
+                    lengths.append(moves)
+                    games_done = len(winners)
+                    while next_selfplay_log > 0 and games_done >= next_selfplay_log:
+                        avg_len = float(np.mean(lengths)) if lengths else 0.0
+                        elapsed = time.perf_counter() - iteration_start
+                        print(
+                            f"iter={iteration:5d} selfplay={games_done:3d}/{args.games_per_iter:3d} "
+                            f"avg_len={avg_len:6.2f} buffer={len(replay_buffer):6d} elapsed={elapsed:7.1f}s"
+                        )
+                        next_selfplay_log += args.log_every_games
+            else:
+                policy_state = clone_state_dict_cpu(policy)
+                task_counts = split_game_counts(args.games_per_iter, args.selfplay_workers)
+                tasks = [
+                    SelfPlayWorkerTask(
+                        policy_version=iteration,
+                        seed=args.seed + iteration * 10_000 + task_index * 257,
+                        games=game_count,
+                        channels=args.channels,
+                        conv_layers=args.conv_layers,
+                        device_name=selfplay_device_name,
+                        state_dict=policy_state,
+                        board_size=args.board_size,
+                        win_length=args.win_length,
+                        mcts_sims=args.mcts_sims,
+                        c_puct=args.c_puct,
+                        temperature=args.temperature,
+                        temperature_drop_moves=args.temperature_drop_moves,
+                        dirichlet_alpha=args.dirichlet_alpha,
+                        noise_eps=args.noise_eps,
+                        random_opening_moves=args.random_opening_moves,
+                        opening_sampler=args.opening_sampler,
+                        opening_outer_ring_prob=args.opening_outer_ring_prob,
+                        opening_non_center_prob=args.opening_non_center_prob,
+                        opening_neighbor_radius=args.opening_neighbor_radius,
+                        edge_buildup_opening_prob=args.edge_buildup_opening_prob,
+                        threat_opening_prob=args.threat_opening_prob,
+                        threat_center_weight=args.threat_center_weight,
+                        threat_near_edge_weight=args.threat_near_edge_weight,
+                        threat_edge_weight=args.threat_edge_weight,
+                    )
+                    for task_index, game_count in enumerate(task_counts)
+                ]
+                for game_examples, chunk_winners, chunk_lengths in executor.map(self_play_worker, tasks):
+                    replay_buffer.extend(game_examples)
+                    winners.extend(chunk_winners)
+                    lengths.extend(chunk_lengths)
+                    games_done = len(winners)
+                    while next_selfplay_log > 0 and games_done >= next_selfplay_log:
+                        avg_len = float(np.mean(lengths)) if lengths else 0.0
+                        elapsed = time.perf_counter() - iteration_start
+                        print(
+                            f"iter={iteration:5d} selfplay={games_done:3d}/{args.games_per_iter:3d} "
+                            f"avg_len={avg_len:6.2f} buffer={len(replay_buffer):6d} elapsed={elapsed:7.1f}s"
+                        )
+                        next_selfplay_log += args.log_every_games
+
+            losses: list[tuple[float, float, float]] = []
+            if len(replay_buffer) >= args.batch_size:
+                policy.train()
+                for step_idx in range(args.train_steps):
+                    batch = random.sample(replay_buffer, args.batch_size)
+                    losses.append(
+                        train_batch(
+                            policy=policy,
+                            optimizer=optimizer,
+                            batch=batch,
+                            device=device,
+                            value_coef=args.value_coef,
+                        )
+                    )
+                    if args.log_every_train_steps > 0 and (step_idx + 1) % args.log_every_train_steps == 0:
+                        elapsed = time.perf_counter() - iteration_start
+                        recent_loss, recent_policy, recent_value = losses[-1]
+                        print(
+                            f"iter={iteration:5d} train={step_idx + 1:3d}/{args.train_steps:3d} "
+                            f"loss={recent_loss:7.4f} policy={recent_policy:7.4f} "
+                            f"value={recent_value:7.4f} elapsed={elapsed:7.1f}s"
+                        )
+
+            avg_loss = float(np.mean([item[0] for item in losses])) if losses else 0.0
+            avg_policy_loss = float(np.mean([item[1] for item in losses])) if losses else 0.0
+            avg_value_loss = float(np.mean([item[2] for item in losses])) if losses else 0.0
+            p1_wins = sum(1 for item in winners if item == 1)
+            p2_wins = sum(1 for item in winners if item == -1)
+            draws = sum(1 for item in winners if item == 0)
+            avg_len = float(np.mean(lengths)) if lengths else 0.0
+            message = (
+                f"iter={iteration:5d} loss={avg_loss:7.4f} policy={avg_policy_loss:7.4f} "
+                f"value={avg_value_loss:7.4f} p1={p1_wins:3d} p2={p2_wins:3d} draw={draws:3d} "
+                f"avg_len={avg_len:6.2f} buffer={len(replay_buffer):6d}"
+            )
+
+            if args.eval_every > 0 and iteration % args.eval_every == 0:
+                policy.eval()
+                random_win_rate, rwins, rdraws, rlosses = evaluate_vs_opponent(
                     policy=policy,
                     board_size=args.board_size,
                     win_length=args.win_length,
                     device=device,
+                    games=args.eval_games,
+                    opponent="random",
                     agent="mcts",
                     mcts_sims=args.eval_mcts_sims,
                     c_puct=args.c_puct,
-                    max_cases=args.eval_threat_cases,
                 )
-                message += f" threat_block_rate={threat_block_rate:.3f} ({threat_blocks}/{threat_total})"
-                if (
-                    args.early_stop_threat_block_rate > 0.0
-                    and iteration >= args.early_stop_min_iterations
-                    and threat_block_rate >= args.early_stop_threat_block_rate
-                ):
-                    threat_stop_hits += 1
-                    message += f" threat_stop_hits={threat_stop_hits}/{args.early_stop_threat_patience}"
-                elif args.early_stop_threat_block_rate > 0.0:
-                    threat_stop_hits = 0
-        print(message)
+                message += f" random_win_rate={random_win_rate:.3f} ({rwins}/{rdraws}/{rlosses})"
+                if args.eval_heuristic_games > 0:
+                    heuristic_win_rate, hwins, hdraws, hlosses = evaluate_vs_opponent(
+                        policy=policy,
+                        board_size=args.board_size,
+                        win_length=args.win_length,
+                        device=device,
+                        games=args.eval_heuristic_games,
+                        opponent="heuristic",
+                        agent="mcts",
+                        mcts_sims=args.eval_mcts_sims,
+                        c_puct=args.c_puct,
+                    )
+                    message += f" heuristic_win_rate={heuristic_win_rate:.3f} ({hwins}/{hdraws}/{hlosses})"
+                    if (
+                        args.early_stop_heuristic_win_rate > 0.0
+                        and iteration >= args.early_stop_min_iterations
+                        and heuristic_win_rate >= args.early_stop_heuristic_win_rate
+                    ):
+                        heuristic_stop_hits += 1
+                        message += (
+                            f" heuristic_stop_hits={heuristic_stop_hits}/{args.early_stop_heuristic_patience}"
+                        )
+                    elif args.early_stop_heuristic_win_rate > 0.0:
+                        heuristic_stop_hits = 0
+                if args.eval_threat_cases > 0:
+                    threat_block_rate, threat_blocks, threat_total = evaluate_threat_response_cases(
+                        policy=policy,
+                        board_size=args.board_size,
+                        win_length=args.win_length,
+                        device=device,
+                        agent="mcts",
+                        mcts_sims=args.eval_mcts_sims,
+                        c_puct=args.c_puct,
+                        max_cases=args.eval_threat_cases,
+                    )
+                    message += f" threat_block_rate={threat_block_rate:.3f} ({threat_blocks}/{threat_total})"
+                    if (
+                        args.early_stop_threat_block_rate > 0.0
+                        and iteration >= args.early_stop_min_iterations
+                        and threat_block_rate >= args.early_stop_threat_block_rate
+                    ):
+                        threat_stop_hits += 1
+                        message += f" threat_stop_hits={threat_stop_hits}/{args.early_stop_threat_patience}"
+                    elif args.early_stop_threat_block_rate > 0.0:
+                        threat_stop_hits = 0
+            print(message)
 
-        if args.eval_every > 0 and iteration % args.eval_every == 0:
-            for trace_index in range(args.eval_trace_games):
-                winner, trace_moves, board_snapshots, final_board = evaluate_self_play_trace(
-                    policy=policy,
-                    board_size=args.board_size,
-                    win_length=args.win_length,
-                    device=device,
-                    mcts_sims=args.eval_mcts_sims,
-                    c_puct=args.c_puct,
-                )
+            if args.eval_every > 0 and iteration % args.eval_every == 0:
+                for trace_index in range(args.eval_trace_games):
+                    winner, trace_moves, board_snapshots, final_board = evaluate_self_play_trace(
+                        policy=policy,
+                        board_size=args.board_size,
+                        win_length=args.win_length,
+                        device=device,
+                        mcts_sims=args.eval_mcts_sims,
+                        c_puct=args.c_puct,
+                    )
+                    print(
+                        f"eval_trace game={trace_index + 1} winner={winner_to_text(winner)} "
+                        f"moves={len(trace_moves)}"
+                    )
+                    print(f"eval_trace seq {format_trace_moves(trace_moves, args.eval_trace_max_moves)}")
+                    if args.eval_trace_print_boards:
+                        print("eval_trace boards:")
+                        print(format_trace_boards(trace_moves, board_snapshots, args.eval_trace_max_moves))
+                    print("eval_trace board:")
+                    print(final_board)
+                for trace_index in range(args.eval_heuristic_trace_games):
+                    policy_player = 1 if trace_index % 2 == 0 else -1
+                    winner, trace_moves, board_snapshots, final_board = evaluate_heuristic_trace(
+                        policy=policy,
+                        board_size=args.board_size,
+                        win_length=args.win_length,
+                        device=device,
+                        policy_player=policy_player,
+                        agent="mcts",
+                        mcts_sims=args.eval_mcts_sims,
+                        c_puct=args.c_puct,
+                    )
+                    role = "X" if policy_player == 1 else "O"
+                    print(
+                        f"heuristic_trace game={trace_index + 1} policy_as={role} "
+                        f"winner={winner_to_text(winner)} moves={len(trace_moves)}"
+                    )
+                    print(f"heuristic_trace seq {format_trace_moves(trace_moves, args.eval_trace_max_moves)}")
+                    if args.eval_trace_print_boards:
+                        print("heuristic_trace boards:")
+                        print(format_trace_boards(trace_moves, board_snapshots, args.eval_trace_max_moves))
+                    print("heuristic_trace board:")
+                    print(final_board)
+
+            if args.save_every > 0 and iteration % args.save_every == 0:
+                checkpoint_path = last_checkpoint_path(args.checkpoint)
+                save_checkpoint(checkpoint_path, policy, args)
+                print(f"saved checkpoint to {checkpoint_path}")
+
+            if (
+                args.early_stop_loss > 0.0
+                and iteration >= args.early_stop_min_iterations
+                and losses
+                and avg_loss <= args.early_stop_loss
+            ):
+                early_stop_hits += 1
                 print(
-                    f"eval_trace game={trace_index + 1} winner={winner_to_text(winner)} "
-                    f"moves={len(trace_moves)}"
+                    f"early_stop progress hits={early_stop_hits}/{args.early_stop_patience} "
+                    f"threshold={args.early_stop_loss:.4f}"
                 )
-                print(f"eval_trace seq {format_trace_moves(trace_moves, args.eval_trace_max_moves)}")
-                if args.eval_trace_print_boards:
-                    print("eval_trace boards:")
-                    print(format_trace_boards(trace_moves, board_snapshots, args.eval_trace_max_moves))
-                print("eval_trace board:")
-                print(final_board)
-            for trace_index in range(args.eval_heuristic_trace_games):
-                policy_player = 1 if trace_index % 2 == 0 else -1
-                winner, trace_moves, board_snapshots, final_board = evaluate_heuristic_trace(
-                    policy=policy,
-                    board_size=args.board_size,
-                    win_length=args.win_length,
-                    device=device,
-                    policy_player=policy_player,
-                    agent="mcts",
-                    mcts_sims=args.eval_mcts_sims,
-                    c_puct=args.c_puct,
-                )
-                role = "X" if policy_player == 1 else "O"
+            else:
+                early_stop_hits = 0
+
+            if (
+                args.early_stop_loss > 0.0
+                and args.early_stop_patience > 0
+                and early_stop_hits >= args.early_stop_patience
+            ):
+                save_checkpoint(args.checkpoint, policy, args)
                 print(
-                    f"heuristic_trace game={trace_index + 1} policy_as={role} "
-                    f"winner={winner_to_text(winner)} moves={len(trace_moves)}"
+                    f"early_stop triggered at iter={iteration} "
+                    f"avg_loss={avg_loss:.4f} threshold={args.early_stop_loss:.4f}"
                 )
-                print(f"heuristic_trace seq {format_trace_moves(trace_moves, args.eval_trace_max_moves)}")
-                if args.eval_trace_print_boards:
-                    print("heuristic_trace boards:")
-                    print(format_trace_boards(trace_moves, board_snapshots, args.eval_trace_max_moves))
-                print("heuristic_trace board:")
-                print(final_board)
+                print(f"saved checkpoint to {args.checkpoint}")
+                return
 
-        if args.save_every > 0 and iteration % args.save_every == 0:
-            checkpoint_path = last_checkpoint_path(args.checkpoint)
-            save_checkpoint(checkpoint_path, policy, args)
-            print(f"saved checkpoint to {checkpoint_path}")
+            if (
+                args.early_stop_heuristic_win_rate > 0.0
+                and args.early_stop_heuristic_patience > 0
+                and heuristic_stop_hits >= args.early_stop_heuristic_patience
+            ):
+                save_checkpoint(args.checkpoint, policy, args)
+                print(
+                    f"early_stop heuristic triggered at iter={iteration} "
+                    f"threshold={args.early_stop_heuristic_win_rate:.3f}"
+                )
+                print(f"saved checkpoint to {args.checkpoint}")
+                return
 
-        if (
-            args.early_stop_loss > 0.0
-            and iteration >= args.early_stop_min_iterations
-            and losses
-            and avg_loss <= args.early_stop_loss
-        ):
-            early_stop_hits += 1
-            print(
-                f"early_stop progress hits={early_stop_hits}/{args.early_stop_patience} "
-                f"threshold={args.early_stop_loss:.4f}"
-            )
-        else:
-            early_stop_hits = 0
+            if (
+                args.early_stop_threat_block_rate > 0.0
+                and args.early_stop_threat_patience > 0
+                and threat_stop_hits >= args.early_stop_threat_patience
+            ):
+                save_checkpoint(args.checkpoint, policy, args)
+                print(
+                    f"early_stop threat defense triggered at iter={iteration} "
+                    f"threshold={args.early_stop_threat_block_rate:.3f}"
+                )
+                print(f"saved checkpoint to {args.checkpoint}")
+                return
 
-        if (
-            args.early_stop_loss > 0.0
-            and args.early_stop_patience > 0
-            and early_stop_hits >= args.early_stop_patience
-        ):
-            save_checkpoint(args.checkpoint, policy, args)
-            print(
-                f"early_stop triggered at iter={iteration} "
-                f"avg_loss={avg_loss:.4f} threshold={args.early_stop_loss:.4f}"
-            )
-            print(f"saved checkpoint to {args.checkpoint}")
-            return
-
-        if (
-            args.early_stop_heuristic_win_rate > 0.0
-            and args.early_stop_heuristic_patience > 0
-            and heuristic_stop_hits >= args.early_stop_heuristic_patience
-        ):
-            save_checkpoint(args.checkpoint, policy, args)
-            print(
-                f"early_stop heuristic triggered at iter={iteration} "
-                f"threshold={args.early_stop_heuristic_win_rate:.3f}"
-            )
-            print(f"saved checkpoint to {args.checkpoint}")
-            return
-
-        if (
-            args.early_stop_threat_block_rate > 0.0
-            and args.early_stop_threat_patience > 0
-            and threat_stop_hits >= args.early_stop_threat_patience
-        ):
-            save_checkpoint(args.checkpoint, policy, args)
-            print(
-                f"early_stop threat defense triggered at iter={iteration} "
-                f"threshold={args.early_stop_threat_block_rate:.3f}"
-            )
-            print(f"saved checkpoint to {args.checkpoint}")
-            return
-
-    save_checkpoint(args.checkpoint, policy, args)
-    print(f"saved checkpoint to {args.checkpoint}")
+        save_checkpoint(args.checkpoint, policy, args)
+        print(f"saved checkpoint to {args.checkpoint}")
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def evaluate(args: argparse.Namespace) -> None:
@@ -1688,6 +1856,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--early-stop-heuristic-patience", type=int, default=0)
     train_parser.add_argument("--early-stop-threat-block-rate", type=float, default=0.0)
     train_parser.add_argument("--early-stop-threat-patience", type=int, default=0)
+    train_parser.add_argument("--selfplay-workers", type=int, default=1)
+    train_parser.add_argument(
+        "--selfplay-device",
+        choices=["same", "auto", "cpu", "cuda", "mps"],
+        default="same",
+    )
     train_parser.add_argument("--seed", type=int, default=42)
     train_parser.add_argument("--init-checkpoint", type=Path, default=None)
     train_parser.set_defaults(func=train)

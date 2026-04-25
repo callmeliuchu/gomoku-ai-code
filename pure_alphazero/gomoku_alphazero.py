@@ -1016,9 +1016,14 @@ def _get_worker_policy(task: SelfPlayWorkerTask) -> tuple[PolicyValueNet, torch.
     )
     cached_key = _SELF_PLAY_WORKER_CACHE.get("key")
     if cached_key != cache_key:
-        torch.set_num_threads(1)
-        if hasattr(torch, "set_num_interop_threads"):
-            torch.set_num_interop_threads(1)
+        if "thread_limits_set" not in _SELF_PLAY_WORKER_CACHE:
+            torch.set_num_threads(1)
+            if hasattr(torch, "set_num_interop_threads"):
+                try:
+                    torch.set_num_interop_threads(1)
+                except RuntimeError:
+                    pass
+            _SELF_PLAY_WORKER_CACHE["thread_limits_set"] = True
         device = choose_device(task.device_name)
         policy = PolicyValueNet(channels=task.channels, conv_layers=task.conv_layers).to(device)
         policy.load_state_dict(task.state_dict)
